@@ -9,6 +9,7 @@ import numpy as np
 import torch.distributed as dist
 from abc import ABC, abstractmethod
 from typing import Optional
+import time
 
 from .default_configs import SetUpConfig, ModelConfig, DatasetConfig, OptimizerConfig, PathConfig, merge_config
 from .trainer_utils import manual_seed, load_ckpt, save_ckpt
@@ -200,13 +201,26 @@ class BaseTrainer(ABC):
         """
         self.to(self.device)
         
+        ### time estimate thorughput
         result = self.optimizer.optimize(self)
+        epochs_done = (result.get('train', {}).get('epoch', []) or [0])[-1]
+        batches_per_epoch = len(getattr(self, 'train_loader', [])) or 0
+        total_batches = epochs_done * batches_per_epoch
+        train_wall = self.config.datarow.get('training time', np.nan)
+
+        if total_batches > 0 and np.isfinite(np.array(train_wall, dtype=float)):
+            self.config.datarow['batches_per_s'] = total_batches / train_wall
+
+
         self.config.datarow['training time'] = result['time']
         
         self.save_ckpt()
 
         if len(result['train']['loss']) == 0:
+            ### time measurement for inference
+            t0_test = time.perf_counter()
             self.test()
+            t1_test = time.perf_counter()
         else:
             kwargs = {
                 "epochs": result['train']['epoch'],
@@ -222,7 +236,13 @@ class BaseTrainer(ABC):
                 kwargs['best_loss'] = result['best']['loss']
             
             self.plot_losses(**kwargs)
+            t0_test = time.perf_counter()
             self.test()
+            t1_test = time.perf_counter()
+        self.config.datarow['inference time'] = t1_test - t0_test
+        if getattr(self, 'wandb_run', None):
+            import wandb
+            self.wandb_run.log({"perf/test_wall_s": t1_test - t0_test})
 
     def plot_losses(self, epochs, losses, val_epochs=None, val_losses=None, 
                    best_epoch=None, best_loss=None):
@@ -237,10 +257,12 @@ class BaseTrainer(ABC):
             ax.set_xlabel('Epoch')
             ax.set_ylabel('Loss')
             ax.set_title('Loss vs Epoch')
-            ax.legend()
+            if len(ax.get_legend_handles_labels()) > 0:
+                ax.legend()
             ax.set_xlim(left=0)
             if (np.array(losses) > 0).all():
                 ax.set_yscale('log')
+            os.makedirs(os.path.dirname(self.path_config.loss_path), exist_ok=True)
             np.savez(self.path_config.loss_path[:-4] + ".npz", epochs=epochs, losses=losses)
             plt.savefig(self.path_config.loss_path)
         else:
@@ -261,11 +283,13 @@ class BaseTrainer(ABC):
             ax[1].set_xlabel('Epoch')
             ax[1].set_ylabel('relative error')
             ax[1].set_title('Loss vs relative error')
-            ax[1].legend()
+            if len(ax[1].get_legend_handles_labels()) > 0:
+                ax[1].legend()
             ax[1].set_xlim(left=0)
             if (np.array(val_losses) > 0).all():
                 ax[1].set_yscale('log')
             
+            os.makedirs(os.path.dirname(self.path_config.loss_path), exist_ok=True)
             plt.savefig(self.path_config.loss_path)
             np.savez(self.path_config.loss_path[:-4] + ".npz", 
                     epochs=epochs, losses=losses, 
@@ -278,3 +302,41 @@ class BaseTrainer(ABC):
     def variance_test(self):
         """Variance test (to be implemented by subclasses)."""
         raise NotImplementedError
+
+
+    def _ckpt_path(self, suffix: str) -> str:
+        base = self.path_config.ckpt_path  # e.g. ".../ckpt/model.pt"
+        if base.endswith(".pt"):
+            return base[:-3] + f".{suffix}.pt"
+        return base + f".{suffix}"
+
+    def save_ckpt_epoch(self, epoch: int, extra: dict | None = None):
+        """Save 'epoch' checkpoint alongside optimizer & epoch info."""
+        os.makedirs(os.path.dirname(self.path_config.ckpt_path), exist_ok=True)
+        from .trainer_utils import save_ckpt
+        save_ckpt(
+            self._ckpt_path(f"e{epoch:04d}"),
+            model=self.model,
+            # optimizer=getattr(self.optimizer, "optimizer", None),
+            # extra={"epoch": epoch, **(extra or {})}
+        )
+
+    def save_ckpt_best(self, epoch: int, best_loss: float, extra: dict | None = None):
+        os.makedirs(os.path.dirname(self.path_config.ckpt_path), exist_ok=True)
+        from .trainer_utils import save_ckpt
+        save_ckpt(
+            self._ckpt_path("best"),
+            model=self.model,
+            # optimizer=getattr(self.optimizer, "optimizer", None),
+            # extra={"epoch": epoch, "best_loss": float(best_loss), **(extra or {})}
+        )
+
+    def save_ckpt_last(self, epoch: int | None = None, extra: dict | None = None):
+        os.makedirs(os.path.dirname(self.path_config.ckpt_path), exist_ok=True)
+        from .trainer_utils import save_ckpt
+        save_ckpt(
+            self._ckpt_path("last"),
+            model=self.model,
+            # optimizer=getattr(self.optimizer, "optimizer", None),
+            # extra={"epoch": (int(epoch) if epoch is not None else -1), **(extra or {})}
+        )

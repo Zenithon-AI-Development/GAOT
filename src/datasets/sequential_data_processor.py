@@ -152,19 +152,40 @@ class SequentialDataProcessor(DataProcessor):
         x_array = raw_data['x']  # coordinate data
         t_values = raw_data['t']  # [num_timesteps]
         
-        # Limit time steps based on max_time_diff
-        if self.max_time_diff is not None:
-            max_timesteps = self.max_time_diff + 1  # +1 because we need t=0 to t=max_time_diff
-            u_array = u_array[:, :max_timesteps, :, :]
-            if c_array is not None:
-                c_array = c_array[:, :max_timesteps, :, :]
-            if is_variable_coords and x_array.shape[1] > 1:
-                x_array = x_array[:, :max_timesteps, :, :]
-            t_values = t_values[:max_timesteps]
-            self.t_values = t_values
+        # Limit time steps based on max_time_diff DO NOT TRUNCATE TRAJECTORIES
+        # if self.max_time_diff is not None:
+        #     max_timesteps = self.max_time_diff + 1  # +1 because we need t=0 to t=max_time_diff
+        #     u_array = u_array[:, :max_timesteps, :, :]
+        #     if c_array is not None:
+        #         c_array = c_array[:, :max_timesteps, :, :]
+        #     if is_variable_coords and x_array.shape[1] > 1:
+        #         x_array = x_array[:, :max_timesteps, :, :]
+        #     t_values = t_values[:max_timesteps]
+        #     self.t_values = t_values
         
         # Split data
         train_indices, val_indices, test_indices = self._get_split_indices(u_array.shape[0])
+
+        # # === Pair-count report (analytical; matches GAOT's all-to-all pairing) ===
+        # def _count_pairs(T:int, step:int, kmax:int) -> int:
+        #     if T <= 1: return 0
+        #     M = min(T-1, int(kmax))
+        #     s = max(1, int(step))
+        #     # number of lag steps
+        #     m = M // s
+        #     # sum_{j=1..m} ( floor((M - j*s)/s) + 1 )
+        #     total = 0
+        #     for j in range(1, m+1):
+        #         total += ( (M - j*s) // s ) + 1
+        #     return int(total)
+
+        # T_full = len(t_values)
+        # pairs_per_traj = _count_pairs(T_full, self.time_step, self.max_time_diff)
+        # n_train = len(train_indices); n_val = len(val_indices); n_test = len(test_indices)
+        # print(f"[PAIRS] T={T_full}, step={self.time_step}, max_time_diff={self.max_time_diff} "
+        #       f"→ ~{pairs_per_traj} pairs/trajectory")
+        # print(f"[PAIRS] train≈{pairs_per_traj*n_train:,}  val≈{pairs_per_traj*n_val:,}  test≈{pairs_per_traj*n_test:,}")
+
 
         u_train = np.ascontiguousarray(u_array[train_indices])
         u_val = np.ascontiguousarray(u_array[val_indices])
@@ -245,6 +266,7 @@ class SequentialDataProcessor(DataProcessor):
                 t_values=train_data['t'],
                 metadata=self.metadata,
                 max_time_diff=self.max_time_diff,
+                time_step=self.time_step,
                 stepper_mode=self.stepper_mode,
                 stats=self.stats,
                 use_time_norm=self.use_time_norm,
@@ -258,6 +280,7 @@ class SequentialDataProcessor(DataProcessor):
                 t_values=val_data['t'],
                 metadata=self.metadata,
                 max_time_diff=self.max_time_diff,
+                time_step=self.time_step,
                 stepper_mode=self.stepper_mode,
                 stats=self.stats,
                 use_time_norm=self.use_time_norm,
@@ -293,6 +316,7 @@ class SequentialDataProcessor(DataProcessor):
             t_values=test_data['t'],
             metadata=self.metadata,
             max_time_diff=self.max_time_diff,
+            time_step=self.time_step,
             stepper_mode=self.stepper_mode,
             stats=self.stats,
             use_time_norm=self.use_time_norm,

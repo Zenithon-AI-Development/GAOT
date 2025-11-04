@@ -1,9 +1,9 @@
 """
 Unified MAGNO (Multiscale Attentional Graph Neural Operator) implementation
-Supporting both 2D and 3D coordinates with flexible batch processing modes.
+Supporting 1D, 2D and 3D coordinates with flexible batch processing modes.
 
 This module is a flexible implementation that can handle:
-- 2D and 3D coordinate spaces
+- 1D, 2D and 3D coordinate spaces
 - Fixed coordinates (fx mode) and variable coordinates (vx mode) 
 - Efficient caching and neighbor computation
 - Edge drop/sampling
@@ -19,6 +19,7 @@ from .utils.neighbor_search import NeighborSearch
 from .utils.edge_drop import apply_edge_drop_csr
 from .gemb import GeometricEmbedding, node_pos_encode
 from .agno import AGNO
+from ...utils.timing_helpers import section, add_metric
 
 ############
 # MAGNO Config
@@ -28,7 +29,7 @@ class MAGNOConfig:
     """Simplified MAGNO Configuration with reduced parameters"""
     
     # --- Core Parameters ---
-    coord_dim: int = 2                                      # Coordinate dimension (2 for 2D, 3 for 3D)
+    coord_dim: int = 2                                      # Coordinate dimension (1 for 1D, 2 for 2D, 3 for 3D)
     radius: float = 0.033                                   # Radius for neighbor search
     hidden_size: int = 64                                   # Base hidden size for all MLPs
     mlp_layers: int = 3                                     # Number of MLP layers (consistent across all MLPs)
@@ -61,8 +62,8 @@ class MAGNOConfig:
     
     def __post_init__(self):
         """Validate configuration parameters"""
-        if self.coord_dim not in [2, 3]:
-            raise ValueError(f"coord_dim must be 2 or 3, got {self.coord_dim}")
+        if self.coord_dim < 1 or self.coord_dim > 3:
+            raise ValueError(f"coord_dim must be 1, 2, or 3, got {self.coord_dim}")
         if self.sampling_strategy == 'ratio' and (self.sample_ratio is None or not 0 < self.sample_ratio <= 1):
             raise ValueError("sample_ratio must be in (0, 1] when using 'ratio' sampling")
         if self.sampling_strategy == 'max_neighbors' and (self.max_neighbors is None or self.max_neighbors <= 0):
@@ -73,13 +74,14 @@ class MAGNOConfig:
 ############
 class MAGNOEncoder(nn.Module):
     """
-    Unified MAGNO Encoder supporting both 2D/3D and fixed/variable coordinate modes.
+    Unified MAGNO Encoder supporting 1D/2D/3D and fixed/variable coordinate modes.
     
     Coordinate Modes:
     - Fixed (fx): All batches share the same coordinate layout - more memory/compute efficient
     - Variable (vx): Each batch can have different coordinates - more flexible
     
     Dimension Support:  
+    - 1D: Single coordinate (e.g., radial position)
     - 2D: Traditional x,y coordinates for 2D problems
     - 3D: Full x,y,z coordinates for 3D problems
     """
@@ -180,16 +182,18 @@ class MAGNOEncoder(nn.Module):
             return self.neighbor_cache[cache_key]
         
         neighbors_per_scale = []
-        
+        # print('0')
         if mode == 'fx':
             # Fixed coordinates - compute once for all batches
             for scale in self.scales:
+                # print('1', self.config.radius, self.scales, scale)
                 scaled_radius = self.config.radius * scale
                 neighbors = self.nb_search(
                     data=x_coord,
                     queries=latent_coord,
                     radius=scaled_radius
                 )
+                # print('2')
                 neighbors_per_scale.append(neighbors)
         
         else:  # mode == 'vx'
@@ -218,7 +222,8 @@ class MAGNOEncoder(nn.Module):
                 x_coord: torch.Tensor, 
                 pndata: torch.Tensor,
                 latent_tokens_coord: torch.Tensor, 
-                encoder_nbrs: Optional[Union[List, List[List]]] = None) -> torch.Tensor:
+                encoder_nbrs: Optional[Union[List, List[List]]] = None,
+                timer=None) -> torch.Tensor:
         """
         Unified forward pass supporting both coordinate modes and dimensions.
         
@@ -244,7 +249,7 @@ class MAGNOEncoder(nn.Module):
         # --- Auto-detect coordinate mode ---
         coord_mode = self._detect_coordinate_mode(x_coord)
         batch_size = pndata.shape[0]
-        
+        # print('0')
         # --- Validate inputs based on detected mode ---
         if coord_mode == 'fx':
             if x_coord.shape[1] != self.coord_dim:
@@ -267,11 +272,17 @@ class MAGNOEncoder(nn.Module):
                 raise ValueError("encoder_nbrs required when precompute_edges=True")
             neighbors_per_scale = encoder_nbrs
         else:
-            neighbors_per_scale = self._compute_neighbors(x_coord, latent_tokens_coord, coord_mode)
+            # neighbors_per_scale = self._compute_neighbors(x_coord, latent_tokens_coord, coord_mode)
+            with section(timer, "enc/compute_neighbors"):
+                neighbors_per_scale = self._compute_neighbors(x_coord, latent_tokens_coord, coord_mode)
         
         # --- Lift input features ---
-        pndata = pndata.permute(0, 2, 1)  # [batch, channels, nodes] for ChannelMLP
-        pndata = self.lifting(pndata).permute(0, 2, 1)  # Back to [batch, nodes, channels]
+        # pndata = pndata.permute(0, 2, 1)  # [batch, channels, nodes] for ChannelMLP
+        # pndata = self.lifting(pndata).permute(0, 2, 1)  # Back to [batch, nodes, channels]
+        
+        with section(timer, "enc/lifting"):
+            pndata = pndata.permute(0,2,1)
+            pndata = self.lifting(pndata).permute(0,2,1)
         
         # --- Prepare scale weights if enabled ---
         if self.use_scale_weights:
@@ -281,11 +292,11 @@ class MAGNOEncoder(nn.Module):
         # --- Process each scale ---
         if coord_mode == 'fx':
             encoded_scales = self._forward_fx_mode(
-                x_coord, pndata, latent_tokens_coord, neighbors_per_scale
+                x_coord, pndata, latent_tokens_coord, neighbors_per_scale, timer=timer
             )
         else:
             encoded_scales = self._forward_vx_mode(
-                x_coord, pndata, latent_tokens_coord, neighbors_per_scale
+                x_coord, pndata, latent_tokens_coord, neighbors_per_scale, timer=timer
             )
         
         # --- Combine scales ---
@@ -304,20 +315,26 @@ class MAGNOEncoder(nn.Module):
         
         return encoded
     
-    def _forward_fx_mode(self, x_coord, pndata, latent_coord, neighbors_per_scale):
+    def _forward_fx_mode(self, x_coord, pndata, latent_coord, neighbors_per_scale, timer=None):
         """Forward pass for fixed coordinate mode"""
         batch_size = pndata.shape[0]
         encoded_scales = []
         
         for _, neighbors in enumerate(neighbors_per_scale):
+            # counts
+            add_metric(timer, "enc/edges", neighbors["neighbors_index"].numel())
+            add_metric(timer, "enc/queries", (neighbors["neighbors_row_splits"].shape[0]-1))
+
             # Apply edge drop before passing to AGNO and geoembed
-            neighbors_dropped = apply_edge_drop_csr(
-                neighbors, 
-                self.sampling_strategy, 
-                self.max_neighbors, 
-                self.sample_ratio, 
-                self.training
-            )
+            
+            with section(timer, "enc/edge_drop"):
+                neighbors_dropped = apply_edge_drop_csr(
+                    neighbors, 
+                    self.sampling_strategy, 
+                    self.max_neighbors, 
+                    self.sample_ratio, 
+                    self.training
+                )
             
             # Prepare coordinates for kernel
             if self.node_embedding:
@@ -328,26 +345,31 @@ class MAGNOEncoder(nn.Module):
                 latent_coord_processed = latent_coord
             
             # Apply AGNO for current scale
-            encoded = self.agno(
-                y=phys_coord,
-                x=latent_coord_processed,
-                f_y=pndata,
-                neighbors=neighbors_dropped
-            )
+            with section(timer, "enc/agno"):
+                encoded = self.agno(
+                    y=phys_coord,
+                    x=latent_coord_processed,
+                    f_y=pndata,
+                    neighbors=neighbors_dropped,
+                    timer=timer,
+                    prefix="enc"
+                )
             
             # Apply geometric embedding if enabled
             if self.use_geoembed:
-                geoembedding = self.geoembed(
-                    input_geom=x_coord,
-                    latent_queries=latent_coord,
-                    spatial_nbrs=neighbors_dropped
-                )
-                # Expand to batch size and concatenate
-                geoembedding = geoembedding.unsqueeze(0).expand(batch_size, -1, -1)
-                encoded = torch.cat([encoded, geoembedding], dim=-1)
+                with section(timer, "enc/geoembed"):
+                    geoembedding = self.geoembed(
+                        input_geom=x_coord,
+                        latent_queries=latent_coord,
+                        spatial_nbrs=neighbors_dropped
+                    )
+                    # Expand to batch size and concatenate
+                    geoembedding = geoembedding.unsqueeze(0).expand(batch_size, -1, -1)
                 # Apply recovery MLP
-                encoded = encoded.permute(0, 2, 1)
-                encoded = self.recovery(encoded).permute(0, 2, 1)
+                with section(timer, "enc/recovery"):
+                    encoded = torch.cat([encoded, geoembedding], dim=-1)
+                    encoded = encoded.permute(0, 2, 1)
+                    encoded = self.recovery(encoded).permute(0, 2, 1)
             
             encoded_scales.append(encoded)
         
@@ -417,7 +439,7 @@ class MAGNOEncoder(nn.Module):
 ############
 class MAGNODecoder(nn.Module):
     """
-    Unified MAGNO Decoder supporting both 2D/3D and fixed/variable coordinate modes.
+    Unified MAGNO Decoder supporting 1D/2D/3D and fixed/variable coordinate modes.
     """
     
     def __init__(self, in_channels: int, out_channels: int, config: MAGNOConfig):
@@ -553,7 +575,8 @@ class MAGNODecoder(nn.Module):
                 latent_tokens_coord: torch.Tensor,
                 rndata: torch.Tensor,
                 query_coord: torch.Tensor,
-                decoder_nbrs: Optional[Union[List, List[List]]] = None) -> torch.Tensor:
+                decoder_nbrs: Optional[Union[List, List[List]]] = None,
+                timer = None) -> torch.Tensor:
         """
         Unified forward pass supporting both coordinate modes and dimensions.
         

@@ -7,7 +7,7 @@ import argparse
 
 import toml 
 import json
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig, ListConfig
 from multiprocessing import Pool,Process
 import subprocess
 import platform
@@ -15,6 +15,76 @@ import torch.distributed as dist
 
 from src.trainer.static_trainer import StaticTrainer
 from src.trainer.sequential_trainer import SequentialTrainer
+from argparse import Namespace
+
+#import faulthandler, sys
+#faulthandler.enable()                          # turn on
+#faulthandler.dump_traceback_later(60, repeat=True)
+
+def setup_wandb(arg):
+    wb = getattr(arg, "wandb", None) or {}
+    # accept either "enabled" or "enable"
+    enabled = wb.get("enabled", wb.get("enable", False))
+    if not enabled:
+        return None
+
+    import wandb
+    from omegaconf import OmegaConf, DictConfig, ListConfig
+    from argparse import Namespace
+
+    # convert arg -> plain dict
+    if isinstance(arg, (DictConfig, ListConfig)):
+        cfg_dict = OmegaConf.to_container(arg, resolve=True)
+    elif isinstance(arg, Namespace):
+        cfg_dict = OmegaConf.to_container(OmegaConf.create(vars(arg)), resolve=True)
+    else:
+        try:
+            cfg_dict = dict(arg)
+        except Exception:
+            cfg_dict = vars(arg)
+
+    # run = wandb.init(
+    #     entity="Zenithon-AI",
+    #     project="gaot-hs",
+    #     id="d3uimplx",          # the original run id
+    #     resume="must",        # or "allow"
+    #     allow_val_change=True # lets you update config values
+    # )
+    # run.config.update({"epoch": 110}, allow_val_change=True)
+
+    run = wandb.init(
+        project=wb.get("project", "gaot"),
+        entity=wb.get("entity"),
+        group=wb.get("group"),
+        job_type=wb.get("job_type", "train"),
+        mode=wb.get("mode", "online"),       # "online" | "offline" | "disabled"
+        dir=wb.get("dir", "./wandb"),
+        tags=wb.get("tags", []),
+        notes=wb.get("notes", ""),
+        name=wb.get("run_name", wb.get("name")),   # <— accept either
+        config=cfg_dict,
+        reinit=True,
+        save_code=wb.get("save_code", True),
+    )
+    return run
+
+def apply_wandb_overrides(arg):
+    # If running a Sweep, values from wandb.config should override the JSON
+    try:
+        import wandb
+        from copy import deepcopy
+        cfg = OmegaConf.create(deepcopy(vars(arg)))
+        # allow dot-path keys, e.g. "optimizer.args.lr"
+        for k, v in dict(wandb.config).items():
+            try:
+                OmegaConf.update(cfg, k, v, merge=True)
+            except Exception:
+                # if not a dotted path, try top-level override
+                if k in cfg:
+                    cfg[k] = v
+        return argparse.Namespace(**OmegaConf.to_container(cfg, resolve=True))
+    except Exception:
+        return arg
 
 class FileParser:
     def __init__(self, filename):
@@ -97,11 +167,28 @@ def prepare_arg(arg):
 def run_arg(arg):
     arg = prepare_arg(arg)
 
+    wandb_run = setup_wandb(arg)
+    if wandb_run is not None:
+        arg = apply_wandb_overrides(arg)
+
     Trainer = {
-        "static": StaticTrainer,  
-        "sequential": SequentialTrainer,  
+        "static": StaticTrainer,
+        "sequential": SequentialTrainer,
     }[arg.setup["trainer_name"]]
+
     t = Trainer(arg)
+    t.wandb_run = wandb_run
+    if wandb_run is not None:
+        import wandb
+        wb = getattr(arg, "wandb", {}) or {}
+        wandb.watch(
+            t.model,
+            log=wb.get("watch_log", "all"),
+            log_freq=int(wb.get("watch_freq", 100) or 100)
+    )
+        wandb_run.log({"status/started": 1, "model/params": sum(p.numel() for p in t.model.parameters())}, step=0)
+
+
     if arg.setup["train"]:
         if arg.setup["ckpt"]:
             t.load_ckpt()
@@ -109,6 +196,9 @@ def run_arg(arg):
     if arg.setup["test"]:
         t.load_ckpt()
         t.test()
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
     if getattr(arg.setup, "rank", 0) == 0:
         if os.path.exists(arg.path["database_path"]):

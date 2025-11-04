@@ -31,6 +31,12 @@ Desktop.ini
 .ckpt/
 .database/
 .database_old/
+wandb/
+data/
+perturbed_traj/
+perturbed_trajectories/
+*.zip
+*.hdf5
 
 config/*
 !config/examples

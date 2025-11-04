@@ -1,0 +1,81 @@
+{
+    "setup": {
+        "seed": 42,
+        "device": "cuda:0",
+        "dtype": "torch.float32",
+        "trainer_name": "sequential",
+        "train": false,
+        "test": true,
+        "ckpt": false,
+        "distributed": false
+    },
+
+    "model": {
+        "name": "gaot",
+        "latent_tokens_size": [64, 64],
+        "use_conditional_norm": true,
+        "args": {
+            "magno": {
+                "coord_dim": 2,
+                "scales": [1],
+                "use_scale_weights": true,
+                "radius": 0.055,
+                "hidden_size": 64,
+                "mlp_layers": 3,
+                "lifting_channels": 64
+            },
+            "transformer": {
+                "patch_size": 2,
+                "hidden_size": 256
+            }
+        }
+    },
+
+    "dataset": {
+        "backend": "well_multires",
+        "name": "demo",
+        "metaname": "benchmarking/demo",
+        "base_path": "/home/workspace/flash/DEMO_data/uniform_grid",
+        "use_metadata_stats": false,
+        "use_sparse": false,
+        "train_size": 80,
+        "val_size": 10,
+        "test_size": 10,
+        "max_time_diff": 4,
+        "time_step": 4,
+        "coord_scaling": "global_scaling",
+        "batch_size": 1,
+        "num_workers": 0,
+        "shuffle": false,
+        "metric": "final_step",
+        "predict_mode": "autoregressive",
+        "stepper_mode": "output"
+    },
+
+    "optimizer": {
+        "name": "adamw",
+        "args": {
+            "lr": 8e-4,
+            "weight_decay": 1e-05,
+            "epoch": 500,
+            "loss_scale": 1.0,
+            "eval_every_eps": 2,
+            "scheduler": "mix",
+            "max_lr": 1e-3,
+            "min_lr": 1e-4,
+            "final_lr": 5e-5
+        }
+    },
+
+    "path": {
+        "ckpt_path": ".ckpt/examples/time_dep/demo/demo_multires_small.best.pt",
+        "loss_path": ".loss/examples/time_dep/demo/demo_multires_small_inference.png",
+        "result_path": ".results/examples/time_dep/demo/demo_multires_small_inference.png",
+        "database_path": ".database/examples/time_dep/demo/demo_multires_small_inference.csv"
+    },
+
+    "wandb": {
+        "enabled": false
+    }
+}
+

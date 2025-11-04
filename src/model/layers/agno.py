@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from .utils.segment_csr import segment_csr
 from .mlp import LinearChannelMLP
 from typing import Optional, Literal, Dict
+from ...utils.timing_helpers import section, add_metric
 
 ############
 # Attentional Graph Neural Operator (AGNO)
@@ -150,7 +151,9 @@ class AGNO(nn.Module):
                 neighbors: Dict[str, torch.Tensor], 
                 x: Optional[torch.Tensor] = None, 
                 f_y: Optional[torch.Tensor] = None, 
-                weights: Optional[torch.Tensor] = None):
+                weights: Optional[torch.Tensor] = None,
+                timer = None,
+                prefix = "enc"):
         """Compute attentional kernel integral transform with optional edge drop
 
         Parameters
@@ -184,8 +187,13 @@ class AGNO(nn.Module):
         neighbors_row_splits = neighbors["neighbors_row_splits"]
         num_query_nodes = neighbors_row_splits.shape[0] - 1
 
+        add_metric(timer, f"{prefix}/neighbors", neighbors_index.numel())
+        add_metric(timer, f"{prefix}/queries", num_query_nodes)
+
         # --- Gather features ---
-        rep_features = y[neighbors_index]
+        
+        with section(timer, f"{prefix}/gather"):
+            rep_features = y[neighbors_index]
 
         # --- Batching ---
         ## batching only matters if f_y (latent embedding) values are provided
@@ -209,45 +217,51 @@ class AGNO(nn.Module):
         # --- Attention Logic ---
         attention_weights = None
         if self.use_attn:
-            query_coords = self_features[:, :self.coord_dim]
-            key_coords = rep_features[:, :self.coord_dim]
-            if self.attention_type == 'dot_product':
-                query = self.query_proj(query_coords)  # [num_neighbors, attention_dim]
-                key = self.key_proj(key_coords)        # [num_neighbors, attention_dim]
-                attention_scores = torch.sum(query * key, dim=-1) * self.scaling_factor  # [num_neighbors] 
-            elif self.attention_type == 'cosine':
-                query_norm = F.normalize(query_coords, p=2, dim=-1)
-                key_norm = F.normalize(key_coords, p=2, dim=-1)
-                attention_scores = torch.sum(query_norm * key_norm, dim=-1)  # [num_neighbors]
-            else:
-                raise ValueError(f"Invalid attention_type: {self.attention_type}. Must be 'cosine' or 'dot_product'.")
-            attention_weights = self._segment_softmax(attention_scores, neighbors_row_splits)
+            with section(timer, f"{prefix}/attn_scores"):
+                query_coords = self_features[:, :self.coord_dim]
+                key_coords = rep_features[:, :self.coord_dim]
+                if self.attention_type == 'dot_product':
+                    query = self.query_proj(query_coords)  # [num_neighbors, attention_dim]
+                    key = self.key_proj(key_coords)        # [num_neighbors, attention_dim]
+                    attention_scores = torch.sum(query * key, dim=-1) * self.scaling_factor  # [num_neighbors] 
+                elif self.attention_type == 'cosine':
+                    query_norm = F.normalize(query_coords, p=2, dim=-1)
+                    key_norm = F.normalize(key_coords, p=2, dim=-1)
+                    attention_scores = torch.sum(query_norm * key_norm, dim=-1)  # [num_neighbors]
+                else:
+                    raise ValueError(f"Invalid attention_type: {self.attention_type}. Must be 'cosine' or 'dot_product'.")
+            with section(timer, f"{prefix}/attn_softmax"):
+                attention_weights = self._segment_softmax(attention_scores, neighbors_row_splits)
         else:
             attention_weights = None
         
         # --- Prepare input for the kernel MLP ---
-        agg_features = torch.cat([rep_features, self_features], dim=-1)
-        if f_y is not None and (
-            self.transform_type == "nonlinear_kernelonly"
-            or self.transform_type == "nonlinear"
-        ):
-            if batched:
-                # repeat agg features for every example in the batch
-                agg_features = agg_features.repeat(
-                    [batch_size] + [1] * agg_features.ndim
-                )
-            agg_features = torch.cat([agg_features, in_features], dim=-1)
+        with section(timer, f"{prefix}/kernel_build"):
+            agg_features = torch.cat([rep_features, self_features], dim=-1)
+            if f_y is not None and (
+                self.transform_type == "nonlinear_kernelonly"
+                or self.transform_type == "nonlinear"
+            ):
+                if batched:
+                    # repeat agg features for every example in the batch
+                    agg_features = agg_features.repeat(
+                        [batch_size] + [1] * agg_features.ndim
+                    )
+                agg_features = torch.cat([agg_features, in_features], dim=-1)
 
         # --- Apply Kernel MLP ---
-        rep_features = self.channel_mlp(agg_features) # Compute kernel values k(x,y) or k(x,y,f)
+        with section(timer, f"{prefix}/kernel_mlp"):
+            rep_features = self.channel_mlp(agg_features) # Compute kernel values k(x,y) or k(x,y,f)
 
         # --- Apply f_y multiplication ---
         if f_y is not None and self.transform_type != "nonlinear_kernelonly":
-            rep_features = rep_features * in_features
-        
+            with section(timer, f"{prefix}/f_mul"):
+                rep_features = rep_features * in_features
+            
         # --- Apply attention weights ---
         if self.use_attn:
-            rep_features = rep_features * attention_weights.unsqueeze(-1)
+            with section(timer, f"{prefix}/attn_apply"):
+                rep_features = rep_features * attention_weights.unsqueeze(-1)
         
         # --- Apply Integration Weights ---
         if weights is not None:
@@ -268,7 +282,8 @@ class AGNO(nn.Module):
         if batched:
             splits = splits.repeat([batch_size] + [1] * splits.ndim)
 
-        out_features = segment_csr(rep_features, splits, reduce=reduction, use_scatter=self.use_torch_scatter)
+        with section(timer, f"{prefix}/reduce"):
+            out_features = segment_csr(rep_features, splits, reduce=reduction, use_scatter=self.use_torch_scatter)
 
         return out_features
 

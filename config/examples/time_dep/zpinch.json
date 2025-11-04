@@ -1,0 +1,89 @@
+{
+    "setup": {
+        "seed": 42,
+        "device": "cuda:0",
+        "dtype": "torch.float32",
+        "trainer_name": "sequential",
+        "train": true,
+        "test": false,
+        "ckpt": false
+    },
+
+    "model": {
+        "name": "gaot",
+        "latent_tokens_size": [32, 32],
+        "use_conditional_norm": true,
+        "args": {
+            "magno": {
+                "coord_dim": 2,
+                "scales": [1,2],
+                "use_scale_weights": true,
+                "radius": 0.011,
+                "hidden_size": 32,
+                "mlp_layers": 2,
+                "lifting_channels": 32
+            },
+            "transformer": {
+                "patch_size": 2,
+                "hidden_size": 128
+            }
+        }
+    },
+
+    "dataset": {
+        "backend": "generic_h5",
+        "name": "test",
+        "metaname": "benchmarking/test",
+        "base_path": "/home/workspace/projects/data/test_dataset/",
+        "use_metadata_stats": false,
+        "use_sparse": false,
+        "train_size": 1,
+        "val_size": 1,
+        "test_size": 1,
+        "max_time_diff": 8,
+        "time_step": 4,
+        "coord_scaling": "global_scaling",
+        "batch_size": 1,
+        "num_workers": 0,
+        "shuffle": true,
+        "metric": "final_step",
+        "predict_mode": "all",
+        "stepper_mode": "time_der"
+    },
+
+    "optimizer": {
+        "name": "adamw",
+        "args": {
+            "lr": 8e-4,
+            "weight_decay": 1e-05,
+            "epoch": 5,
+            "loss_scale": 1.0,
+            "eval_every_eps": 2,
+            "scheduler": "mix",
+            "max_lr": 1e-3,
+            "min_lr": 1e-4,
+            "final_lr": 5e-5
+        }
+    },
+
+    "path": {
+        "ckpt_path": ".ckpt/examples/time_dep/hdf5.pt",
+        "loss_path": ".loss/examples/time_dep/hdf5.png",
+        "result_path": ".results/examples/time_dep/hdf5.png",
+        "database_path": ".database/examples/time_dep/hdf5.csv"
+    },
+
+    "wandb": {
+        "enabled": true,
+        "project": "gaot-hdf5",
+        "entity": "Zenithon-AI",
+        "group": "hdf5_test",
+        "run_name": "GAOT_diff_res_testrun",
+        "mode": "online",
+        "tags": ["GAOT","ZPINCH"],
+        "watch_log": "all",
+        "watch_freq": 100,
+        "log_interval": 50,
+        "save_code": true
+  }
+}

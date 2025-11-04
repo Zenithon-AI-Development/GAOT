@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 from rotary_embedding_torch import RotaryEmbedding
 from .mlp import ConditionedNorm
 from .utils.dataclass import shallow_asdict
+from ...utils.timing_helpers import section
 
 ############
 # Config
@@ -75,7 +76,7 @@ class GroupQueryFlashAttention(nn.Module):
         if positional_embedding == "rope":
             self.rotary_emb = RotaryEmbedding(dim=self.head_dim)
 
-    def forward(self, x, condition: Optional[float] = None, relative_positions: Optional[torch.Tensor] = None):
+    def forward(self, x, condition: Optional[float] = None, relative_positions: Optional[torch.Tensor] = None, timer=None):
         """
         Parameters
         ----------
@@ -88,10 +89,11 @@ class GroupQueryFlashAttention(nn.Module):
         
         if self.correction is not None:
             x = self.correction(c=condition, x=x)
-        
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+
+        with section(timer, "vit/qkv_proj"):
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
 
         batch_size, seq_len, _ = q.size()
 
@@ -104,17 +106,21 @@ class GroupQueryFlashAttention(nn.Module):
             v = v.repeat_interleave(self.num_repeat, dim=1)
 
         if relative_positions is not None:
-            q = self.rotary_emb.rotate_queries_or_keys(q)
-            k = self.rotary_emb.rotate_queries_or_keys(k)
+            with section(timer, "vit/rope"):
+                q = self.rotary_emb.rotate_queries_or_keys(q)
+                k = self.rotary_emb.rotate_queries_or_keys(k)
 
         if self.training:
             dp = self.atten_dropout
         else:
             dp = 0.0
-        x = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=dp)
+
+        with section(timer, "vit/sdpa"):
+            x = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=dp)
 
         x = x.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
-        x = self.o_proj(x)
+        with section(timer, "vit/o_proj"):
+            x = self.o_proj(x)
         
         return x
 
@@ -210,7 +216,8 @@ class TransformerBlock(nn.Module):
         x: torch.Tensor,
         condition: Optional[float] = None,
         relative_positions: Optional[torch.Tensor] = None,
-        skip: Optional[torch.Tensor] = None
+        skip: Optional[torch.Tensor] = None,
+        timer=None
     ) -> torch.Tensor:
         """
         Parameters
@@ -227,9 +234,10 @@ class TransformerBlock(nn.Module):
             x = self.skip_proj(x)
         
         h = x if self.attn_norm is None else self.attn_norm(x)
-        h = x + self.attn(h, condition=condition, relative_positions=relative_positions)
+        h = x + self.attn(h, condition=condition, relative_positions=relative_positions, timer=timer)
         h = h if self.ffn_norm is None else self.ffn_norm(h)
-        out = h + self.ffn(h, condition=condition)
+        with section(timer, "vit/ffn"):
+            out = h + self.ffn(h, condition=condition)
         return out
 
 ############
@@ -287,7 +295,7 @@ class Transformer(nn.Module):
             ) for _ in range(num_decoder_layers)
         ])
 
-    def forward(self, x: torch.Tensor, condition: Optional[float] = None, relative_positions: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, condition: Optional[float] = None, relative_positions: Optional[torch.Tensor] = None, timer=None) -> torch.Tensor:
         """ 
         Parameters
         ----------
@@ -299,19 +307,21 @@ class Transformer(nn.Module):
         torch.Tensor
             [..., seq_len, output_size]
         """
-        x = self.input_proj(x)
+        with section(timer, "vit/in_proj"):
+            x = self.input_proj(x)
         skips = []
         
         for layer in self.encoder_layers:
-            x = layer(x, condition=condition, relative_positions=relative_positions)
+            x = layer(x, condition=condition, relative_positions=relative_positions, timer=timer)
             skips.append(x)
 
         if self.middle_layer is not None:
-            x = self.middle_layer(x, condition=condition, relative_positions=relative_positions)
+            x = self.middle_layer(x, condition=condition, relative_positions=relative_positions, timer=timer)
     
         for layer in self.decoder_layers:
             skip = skips.pop() if self.use_long_range_skip else None
-            x = layer(x, condition=condition, relative_positions=relative_positions, skip=skip)
+            x = layer(x, condition=condition, relative_positions=relative_positions, skip=skip, timer=timer)
         
-        x = self.output_proj(x)
+        with section(timer, "vit/out_proj"):
+            x = self.output_proj(x)
         return x

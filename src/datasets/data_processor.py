@@ -199,7 +199,7 @@ class DataProcessor:
         train_size = self.dataset_config.train_size
         val_size = self.dataset_config.val_size
         test_size = self.dataset_config.test_size
-
+        print(total_samples)
         assert train_size + val_size + test_size <= total_samples, \
             "Sum of train, val, and test sizes exceeds total samples"
         
@@ -281,7 +281,14 @@ class DataProcessor:
         """Generate latent query points on a regular grid."""
         phy_domain = self.metadata.domain_x
         
-        if len(token_size) == 2:
+        if len(token_size) == 1:
+            # 1D case
+            x_min, = phy_domain[0]
+            x_max, = phy_domain[1]
+            
+            latent_queries = torch.linspace(x_min, x_max, token_size[0], dtype=self.dtype).reshape(-1, 1)
+        
+        elif len(token_size) == 2:
             # 2D case
             x_min, y_min = phy_domain[0]
             x_max, y_max = phy_domain[1]

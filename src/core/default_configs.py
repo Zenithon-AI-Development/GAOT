@@ -36,6 +36,7 @@ class SetUpConfig:
     rank: int = 0                                               # Rank of current process
     local_rank: int = 0                                         # Local rank of current process
     backend: str = "nccl"                                       # Backend for distributed training
+    profile: bool = False                                       # Enable profiling for performance analysis
 
 
 @dataclass
@@ -60,6 +61,7 @@ class DatasetConfig:
     name: str = "CE-Gauss"                                      # Dataset name
     metaname: str = "compressible_flow/CE-Gauss"                # Dataset metadata identifier
     base_path: str = "/cluster/work/math/camlab-data/rigno-data/unstructured/"  # Base path to dataset
+    backend: str = "netcdf"                                     # "netcdf" | "well"
     train_size: int = 1024                                      # Training set size
     val_size: int = 128                                         # Validation set size
     test_size: int = 256                                        # Test set size
@@ -78,7 +80,7 @@ class DatasetConfig:
     use_time_norm: bool = True                                  # Normalize time features
     metric: str = "final_step"                                  # Evaluation metric: ["final_step", "all_step"]
     predict_mode: str = "all"                                   # Inference mode: ["all", "autoregressive", "direct", "star"]
-    stepper_mode: str = "output"                                # Stepper mode: ["output", "residual", "time_der"]
+    stepper_mode: str = "time_der"                                # Stepper mode: ["output", "residual", "time_der"]
 
 
 @dataclass

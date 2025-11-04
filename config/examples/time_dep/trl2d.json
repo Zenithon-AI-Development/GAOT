@@ -1,0 +1,86 @@
+{
+    "setup": {
+        "seed": 42,
+        "device": "cuda:0",
+        "dtype": "torch.float32",
+        "trainer_name": "sequential",
+        "train": true,
+        "test": false,
+        "ckpt": false
+    },
+
+    "model": {
+        "name": "goat",
+        "latent_tokens_size": [64, 64],
+        "args": {
+            "magno": {
+                "coord_dim": 2,
+                "radius": 0.033,
+                "hidden_size": 64,
+                "mlp_layers": 3,
+                "lifting_channels": 64
+            },
+            "transformer": {
+                "patch_size": 2,
+                "hidden_size": 256
+            }
+        }
+    },
+
+    "dataset": {
+        "backend": "well",
+        "name": "turbulent_radiative_layer_2D",
+        "metaname": "benchmarking/trl2d",
+        "base_path": "/home/workspace/projects/data/well_time_tests/",
+        "use_metadata_stats": false,
+        "use_sparse": false,
+        "train_size": 72,
+        "val_size": 9,
+        "test_size": 9,
+        "max_time_diff": 4,
+        "time_step": 4,
+        "coord_scaling": "global_scaling",
+        "batch_size": 2,
+        "num_workers": 0,
+        "shuffle": true,
+        "metric": "final_step",
+        "predict_mode": "all",
+        "stepper_mode": "time_der"
+    },
+
+    "optimizer": {
+        "name": "adamw",
+        "args": {
+            "lr": 8e-4,
+            "weight_decay": 1e-05,
+            "epoch": 5,
+            "loss_scale": 1.0,
+            "eval_every_eps": 2,
+            "scheduler": "mix",
+            "max_lr": 1e-3,
+            "min_lr": 1e-4,
+            "final_lr": 5e-5
+        }
+    },
+
+    "path": {
+        "ckpt_path": ".ckpt/examples/time_dep/trl2d_mixed.pt",
+        "loss_path": ".loss/examples/time_dep/trl2d_mixed.png",
+        "result_path": ".results/examples/time_dep/trl2d_mixed.png",
+        "database_path": ".database/examples/time_dep/trl2d_mixed.csv"
+    },
+
+    "wandb": {
+        "enabled": true,
+        "project": "gaot-trl2d",
+        "entity": "Zenithon-AI",
+        "group": "trl2d",
+        "run_name": "GAOT_trl2d_mixed",
+        "mode": "online",
+        "tags": ["GAOT","TRL2D"],
+        "watch_log": "all",
+        "watch_freq": 10,
+        "log_interval": 5,
+        "save_code": true
+  }
+}

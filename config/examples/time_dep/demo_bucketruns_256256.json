@@ -1,0 +1,90 @@
+{
+    "setup": {
+        "seed": 42,
+        "device": "cuda:0",
+        "dtype": "torch.float32",
+        "trainer_name": "sequential",
+        "train": true,
+        "test": false,
+        "ckpt": true,
+        "profile": true
+    },
+
+    "model": {
+        "name": "gaot",
+        "latent_tokens_size": [64, 64],
+        "use_conditional_norm": true,
+        "args": {
+            "magno": {
+                "coord_dim": 2,
+                "scales": [1, 2],
+                "use_scale_weights": true,
+                "radius": 0.033,
+                "hidden_size": 64,
+                "mlp_layers": 3,
+                "lifting_channels": 64
+            },
+            "transformer": {
+                "patch_size": 2,
+                "hidden_size": 256
+            }
+        }
+    },
+
+    "dataset": {
+        "backend": "well",
+        "name": "256x256",
+        "metaname": "benchmarking/demo",
+        "base_path": "/home/workspace/flash/DEMO_data/uniform_grid/",
+        "use_metadata_stats": false,
+        "use_sparse": false,
+        "train_size": 3,
+        "val_size": 1,
+        "test_size": 1,
+        "max_time_diff": 120,
+        "time_step": 4,
+        "coord_scaling": "global_scaling",
+        "batch_size": 2,
+        "num_workers": 0,
+        "shuffle": true,
+        "metric": "final_step",
+        "predict_mode": "all",
+        "stepper_mode": "output"
+    },
+
+    "optimizer": {
+        "name": "adamw",
+        "args": {
+            "lr": 1e-4,
+            "weight_decay": 1e-05,
+            "epoch": 20,
+            "loss_scale": 1.0,
+            "eval_every_eps": 2,
+            "scheduler": "mix",
+            "max_lr": 1e-4,
+            "min_lr": 1e-5,
+            "final_lr": 1e-5
+        }
+    },
+
+    "path": {
+        "ckpt_path": ".ckpt/examples/time_dep/demo/demo_bucketruns_256256.pt",
+        "loss_path": ".loss/examples/time_dep/demo/demo_bucketruns_256256.png",
+        "result_path": ".results/examples/time_dep/demo/demo_bucketruns_256256.png",
+        "database_path": ".database/examples/time_dep/demo/demo_bucketruns_256256.csv"
+    },
+
+    "wandb": {
+        "enabled": true,
+        "project": "gaot-demo",
+        "entity": "Zenithon-AI",
+        "group": "demo_bucketruns",
+        "run_name": "GAOT_demo_bucket256256",
+        "mode": "online",
+        "tags": ["GAOT","DEMO"],
+        "watch_log": "all",
+        "watch_freq": 10,
+        "log_interval": 5,
+        "save_code": true
+  }
+}

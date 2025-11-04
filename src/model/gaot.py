@@ -7,14 +7,17 @@ from dataclasses import dataclass
 from .layers.attn import Transformer
 from .layers.magno import MAGNOEncoder, MAGNODecoder
 
+# timing helpers (section is a no-op if timer is None via your helper)
+from ..utils.timing_helpers import section
+
 
 class GAOT(nn.Module):
     """
-    Geometry-Aware Operator Transformer (GAOT) for 2D/3D meshes with fixed or variable coordinates.
+    Geometry-Aware Operator Transformer (GAOT) for 1D/2D/3D meshes with fixed or variable coordinates.
     Architecture: MAGNO Encoder + Vision Transformer + MAGNO Decoder
     
     Supports:
-    - 2D and 3D coordinate spaces
+    - 1D, 2D and 3D coordinate spaces
     - Fixed coordinates (fx) and variable coordinates (vx) modes
     """
 
@@ -26,8 +29,8 @@ class GAOT(nn.Module):
         
         # Validate parameters
         coord_dim = config.args.magno.coord_dim
-        if coord_dim not in [2, 3]:
-            raise ValueError(f"coord_dim must be 2 or 3, got {coord_dim}")
+        if coord_dim < 1 or coord_dim > 3:
+            raise ValueError(f"coord_dim must be 1, 2, or 3, got {coord_dim}")
             
         # --- Define model parameters ---
         self.input_size = input_size
@@ -38,7 +41,13 @@ class GAOT(nn.Module):
         
         # Get latent token dimensions
         latent_tokens_size = config.latent_tokens_size
-        if coord_dim == 2:
+        if coord_dim == 1:
+            if len(latent_tokens_size) != 1:
+                raise ValueError(f"For 1D, latent_tokens_size must have 1 dimension, got {len(latent_tokens_size)}")
+            self.H = latent_tokens_size[0]
+            self.W = None
+            self.D = None
+        elif coord_dim == 2:
             if len(latent_tokens_size) != 2:
                 raise ValueError(f"For 2D, latent_tokens_size must have 2 dimensions, got {len(latent_tokens_size)}")
             self.H = latent_tokens_size[0]
@@ -65,7 +74,9 @@ class GAOT(nn.Module):
     
     def init_processor(self, node_latent_size, config):
         # Initialize the Vision Transformer processor
-        if self.coord_dim == 2:
+        if self.coord_dim == 1:
+            patch_volume = self.patch_size
+        elif self.coord_dim == 2:
             patch_volume = self.patch_size * self.patch_size
         else:  # 3D
             patch_volume = self.patch_size * self.patch_size * self.patch_size
@@ -95,7 +106,10 @@ class GAOT(nn.Module):
         """
         P = self.patch_size
         
-        if self.coord_dim == 2:
+        if self.coord_dim == 1:
+            num_patches_H = self.H // P
+            positions = torch.arange(num_patches_H, dtype=torch.float32).reshape(-1, 1)
+        elif self.coord_dim == 2:
             num_patches_H = self.H // P
             num_patches_W = self.W // P
             positions = torch.stack(torch.meshgrid(
@@ -132,18 +146,21 @@ class GAOT(nn.Module):
     def encode(self, x_coord: torch.Tensor, 
                pndata: torch.Tensor, 
                latent_tokens_coord: torch.Tensor, 
-               encoder_nbrs: list) -> torch.Tensor:
+               encoder_nbrs: list,
+               timer=None) -> torch.Tensor:
         
         encoded = self.encoder(
             x_coord=x_coord, 
             pndata=pndata,
             latent_tokens_coord=latent_tokens_coord,
-            encoder_nbrs=encoder_nbrs)
+            encoder_nbrs=encoder_nbrs,
+            timer=timer)
         
         return encoded
 
     def process(self, rndata: Optional[torch.Tensor] = None,
-                condition: Optional[float] = None
+                condition: Optional[float] = None,
+                timer=None
                 ) -> torch.Tensor:
         """
         Process regional node data through Vision Transformer.
@@ -165,7 +182,23 @@ class GAOT(nn.Module):
         C = rndata.shape[2]
         P = self.patch_size
         
-        if self.coord_dim == 2:
+        if self.coord_dim == 1:
+            H = self.H
+            
+            # Check input shape
+            assert n_regional_nodes == H, \
+                f"n_regional_nodes ({n_regional_nodes}) != H ({H})"
+            assert H % P == 0, \
+                f"H({H}) must be divisible by P({P})"
+            
+            # Reshape to 1D patches
+            num_patches_H = H // P
+            
+            # Reshape to patches: [batch, H, C] -> [batch, num_patches, P*C]
+            rndata = rndata.reshape(batch_size, num_patches_H, P, C)
+            rndata = rndata.reshape(batch_size, num_patches_H, P * C)
+            
+        elif self.coord_dim == 2:
             H, W = self.H, self.W
             
             # Check input shape
@@ -218,10 +251,13 @@ class GAOT(nn.Module):
             relative_positions = pos
         
         # Apply transformer processor
-        rndata = self.processor(rndata, condition=condition, relative_positions=relative_positions)
+        rndata = self.processor(rndata, condition=condition, relative_positions=relative_positions, timer=timer)
         
         # Reshape back to original regional nodes format
-        if self.coord_dim == 2:
+        if self.coord_dim == 1:
+            rndata = rndata.reshape(batch_size, num_patches_H, P, C)
+            rndata = rndata.reshape(batch_size, H, C)
+        elif self.coord_dim == 2:
             rndata = rndata.view(batch_size, num_patches_H, num_patches_W, P, P, C)
             rndata = rndata.permute(0, 1, 3, 2, 4, 5).contiguous()
             rndata = rndata.view(batch_size, H * W, C)
@@ -235,13 +271,15 @@ class GAOT(nn.Module):
     def decode(self, latent_tokens_coord: torch.Tensor, 
                rndata: torch.Tensor, 
                query_coord: torch.Tensor, 
-               decoder_nbrs: list) -> torch.Tensor:
+               decoder_nbrs: list,
+               timer = None) -> torch.Tensor:
         
         decoded = self.decoder(
             latent_tokens_coord=latent_tokens_coord,
             rndata=rndata, 
             query_coord=query_coord,
-            decoder_nbrs=decoder_nbrs)
+            decoder_nbrs=decoder_nbrs,
+            timer=timer)
         
         return decoded
 
@@ -253,6 +291,7 @@ class GAOT(nn.Module):
                 encoder_nbrs: Optional[list] = None,
                 decoder_nbrs: Optional[list] = None,
                 condition: Optional[float] = None,
+                timer=None,
                 ) -> torch.Tensor:
         """
         Forward pass for GAOT model.
@@ -282,25 +321,74 @@ class GAOT(nn.Module):
             Output tensor of shape [batch_size, n_query_nodes, output_size]
         """
         # Encode: Map physical nodes to regional nodes
-        rndata = self.encode(
-            x_coord=xcoord, 
-            pndata=pndata,
-            latent_tokens_coord=latent_tokens_coord,
-            encoder_nbrs=encoder_nbrs)
+        # Encode / Process / Decode timings
+        if timer is None:
+            timer = getattr(self, "_profiler", None)
         
-        # Process: Apply Vision Transformer on regional nodes
-        rndata = self.process(
-            rndata=rndata, 
-            condition=condition)
+        # Encode: Map physical nodes to regional nodes
+        if timer:
+            with section(timer, "encode"):
+                rndata = self.encode(
+                    x_coord=xcoord,
+                    pndata=pndata,
+                    latent_tokens_coord=latent_tokens_coord,
+                    encoder_nbrs=encoder_nbrs,
+                    timer=timer)
+            # with _prof.section("encode"):
+            #     rndata = self.encode(
+            #         x_coord=xcoord,
+            #         pndata=pndata,
+            #         latent_tokens_coord=latent_tokens_coord,
+            #         encoder_nbrs=encoder_nbrs)
+        else:
+            rndata = self.encode(
+                x_coord=xcoord, 
+                pndata=pndata,
+                latent_tokens_coord=latent_tokens_coord,
+                encoder_nbrs=encoder_nbrs)
 
+        # rndata = self.encode(
+        #     x_coord=xcoord, 
+        #     pndata=pndata,
+        #     latent_tokens_coord=latent_tokens_coord,
+        #     encoder_nbrs=encoder_nbrs)
+
+        # Process: Apply Vision Transformer on regional nodes
+        if timer:
+            # with _prof.section("process"):
+            with section(timer, "process"):
+                rndata = self.process(rndata=rndata, condition=condition, timer=timer)
+        else:
+            rndata = self.process(rndata=rndata, condition=condition)
+
+        # # Process: Apply Vision Transformer on regional nodes
+        # rndata = self.process(
+        #     rndata=rndata, 
+        #     condition=condition)
         # Decode: Map regional nodes back to query nodes
         if query_coord is None:
             query_coord = xcoord
-        output = self.decode(
-            latent_tokens_coord=latent_tokens_coord,
-            rndata=rndata, 
-            query_coord=query_coord,
-            decoder_nbrs=decoder_nbrs)
+
+        if timer:
+            # with _prof.section("decode"):
+            with section(timer, "decode"):
+                output = self.decode(
+                    latent_tokens_coord=latent_tokens_coord,
+                    rndata=rndata,
+                    query_coord=query_coord,
+                    decoder_nbrs=decoder_nbrs,
+                    timer=timer)
+        else:
+            output = self.decode(
+                latent_tokens_coord=latent_tokens_coord,
+                rndata=rndata,
+                query_coord=query_coord,
+                decoder_nbrs=decoder_nbrs)
+        # output = self.decode(
+        #     latent_tokens_coord=latent_tokens_coord,
+        #     rndata=rndata, 
+        #     query_coord=query_coord,
+        #     decoder_nbrs=decoder_nbrs)
 
         return output
     

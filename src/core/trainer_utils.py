@@ -68,7 +68,9 @@ def load_ckpt(path, **kwargs):
             list of torch object
             [model, optimizer, scheduler]
     """
+    print(f"[CHECKPOINT] Loading from: {path}")
     ckpt = torch.load(path)
+    print(f"[CHECKPOINT] Checkpoint keys: {list(ckpt.keys())}")
 
     for k, v in kwargs.items():
         state_dict = ckpt[k]
@@ -260,6 +262,9 @@ def compute_sequential_stats(u_data: np.ndarray, c_data: Optional[np.ndarray],
         
         t_in_indices = np.array(t_in_indices)
         t_out_indices = np.array(t_out_indices)
+
+        # print(t_values)
+        # print(t_in_indices)
         
         start_times = t_values[t_in_indices]
         time_diffs = t_values[t_out_indices] - t_values[t_in_indices]

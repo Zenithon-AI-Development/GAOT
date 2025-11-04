@@ -7,7 +7,6 @@ import numpy as np
 from torch.utils.data import Dataset
 from typing import Optional, Callable, List
 
-
 class CustomDataset(Dataset):
     """
     Custom dataset for variable coordinate (vx) mode data.
@@ -112,20 +111,26 @@ class DynamicPairDataset(Dataset):
         self.num_samples, self.num_timesteps, self.num_nodes, self.num_vars = u_data.shape
         
         # Limit timesteps based on max_time_diff
-        self.num_timesteps = min(self.num_timesteps-1, max_time_diff)
+        # self.num_timesteps = min(self.num_timesteps-1, max_time_diff)
+        self.num_timesteps = self.num_timesteps-1
+
         self.t_values = self.t_values[:self.num_timesteps + 1]
         
         # Generate time pairs
-        self._generate_time_pairs(self.num_timesteps, time_step)
+        self._generate_time_pairs(self.num_timesteps, max_time_diff, time_step)
     
-    def _generate_time_pairs(self, num_timesteps: int, time_step: int):
+    def _generate_time_pairs(self, num_timesteps: int, max_time_diff: int, time_step: int):
         """Generate specific time pairs for training."""
         self.t_in_indices = []
         self.t_out_indices = []
         
+        ### NEW LOGIC OF BUILDING TIME PAIRS
+
         # Generate even lags from 2 to max_time_diff
-        for lag in range(time_step, num_timesteps + 1, time_step):
-            for i in range(0, num_timesteps - lag + 1, time_step):
+        # for lag in range(time_step, num_timesteps + 1, time_step):
+        #     for i in range(0, num_timesteps - lag + 1, time_step):
+        for lag in range(time_step, max_time_diff + 1, time_step):
+            for i in range(0, num_timesteps - lag + 1, 1):
                 t_in_idx = i
                 t_out_idx = i + lag
                 self.t_in_indices.append(t_in_idx)
@@ -359,6 +364,7 @@ class TestDataset(Dataset):
         Returns:
             tuple: (input_features, target_sequence) or with coordinates
         """
+        # print(self.time_indices)
         t_start_idx = self.time_indices[0]
         
         # Get initial state
@@ -392,6 +398,8 @@ class TestDataset(Dataset):
         input_data = torch.cat(input_features, dim=-1)
         
         # Get target sequence (excluding first timestep)
+        # print(self.time_indices)
+        # print(self.u_data.shape)
         target_sequence = self.u_data[idx, self.time_indices[1:]]  # [n_timesteps-1, num_nodes, num_vars]
         
         # For variable coordinates, also return coordinate data
@@ -430,3 +438,49 @@ def create_data_splits(data: torch.Tensor, train_ratio: float = 0.8,
         'val': data[train_end:val_end], 
         'test': data[val_end:]
     }
+
+class FullSequenceDataset(torch.utils.data.Dataset):
+    """
+    Returns the entire trajectory (inputs + conditions + time features).
+    For fixed coords (fx) we don't repeat x per time step in memory.
+    """
+    def __init__(self, u, c, t, tau, x_fixed=None):
+        # u, c: [B, T, N, C*], t, tau: [T], x_fixed: [N, 2] or None
+        self.u, self.c = u, c
+        self.t, self.tau = t, tau
+        self.x_fixed = x_fixed
+        self.B = u.shape[0]
+
+    def __len__(self): return self.B
+
+    def __getitem__(self, i):
+        # Pack time features as 2 channels broadcast over nodes
+        T, N = self.u.shape[1], self.u.shape[2]
+        t_feat  = self.t[None, :, None].expand(1, T, 1)      # 1 x T x 1
+        tau_feat= self.tau[None, :, None].expand(1, T, 1)    # 1 x T x 1
+        # Return dict so your trainer can choose teacher forcing / AR rollout
+        out = {
+            "u": self.u[i],             # T x N x Cu
+            "c": self.c[i],             # T x N x Cc
+            "t": self.t, "tau": self.tau,           # T
+            "t_feats": (t_feat, tau_feat),          # (1 x T x 1, 1 x T x 1)
+        }
+        if self.x_fixed is not None:
+            out["x"] = self.x_fixed     # N x 2
+        return out
+
+def collate_fullseq(batch):
+    # Simple list -> dict of stacked tensors
+    keys = batch[0].keys()
+    coll = {}
+    for k in keys:
+        if k in ("t", "tau"):  # shared timeline
+            coll[k] = batch[0][k]
+        else:
+            if isinstance(batch[0][k], tuple):
+                coll[k] = tuple(torch.stack([b[k][j] for b in batch], dim=0) for j in range(len(batch[0][k])))
+            elif torch.is_tensor(batch[0][k]):
+                coll[k] = torch.stack([b[k] for b in batch], dim=0)
+            else:
+                coll[k] = [b[k] for b in batch]
+    return coll
