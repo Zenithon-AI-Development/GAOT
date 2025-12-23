@@ -67,20 +67,20 @@
     },
 
     "path": {
-        "ckpt_path": ".ckpt/examples/time_dep/demo/demo_multires_small_new.pt",
+        "ckpt_path": ".ckpt/examples/time_dep/demo/demo_multires_small_new_.pt",
         "loss_path": ".loss/examples/time_dep/demo/multires/demo_multires_small.png",
         "result_path": ".results/examples/time_dep/demo/multires/demo_multires_small.png",
         "database_path": ".database/examples/time_dep/demo/multires/demo_multires_small.csv"
     },
 
     "wandb": {
-        "enabled": true,
+        "enabled": false,
         "project": "gaot-demo",
         "entity": "Zenithon-AI",
         "group": "demo_multires_small",
-        "run_name": "GAOT_demo_multires",
-        "mode": "online",
-        "tags": ["GAOT","DEMO"],
+        "run_name": "GAOT_demo_multires_eval",
+        "mode": "offline",
+        "tags": ["GAOT","DEMO","EVAL"],
         "watch_log": "all",
         "watch_freq": 10,
         "log_interval": 5,

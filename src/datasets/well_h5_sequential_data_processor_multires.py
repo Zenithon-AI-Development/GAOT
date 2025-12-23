@@ -123,9 +123,10 @@ class _MultiResBatchIterableDEMO(IterableDataset):
 
     def __iter__(self):
         inner = []
-        for split_dir in self.bucket_dirs:
-            inner.append(
-                WellH5PairIterableDEMO_Lite(
+        valid_bucket_indices = []
+        for idx, split_dir in enumerate(self.bucket_dirs):
+            try:
+                iterable = WellH5PairIterableDEMO_Lite(
                     split_dir=split_dir,
                     stats=self.stats,
                     time_step=self.time_step,
@@ -134,12 +135,25 @@ class _MultiResBatchIterableDEMO(IterableDataset):
                     u_fields_t1=self.u_fields_t1,
                     cache_samples=self.cache_samples,
                 )
-            )
+                inner.append(iterable)
+                valid_bucket_indices.append(idx)
+            except FileNotFoundError as e:
+                # Skip buckets that don't have any .hdf5 files (e.g., missing test data for this resolution)
+                import warnings
+                warnings.warn(f"Skipping bucket {split_dir} due to missing files: {e}", UserWarning)
+                # Continue to next bucket
+                pass
+        
+        if not inner:
+            # No valid buckets available
+            return
+        
         order = np.random.permutation(len(inner)).tolist() if self.shuffle_buckets else list(range(len(inner)))
-        for bi in order:
+        for order_idx in order:
+            bi = valid_bucket_indices[order_idx]  # Original bucket index
             coordB = self.coords[bi]            # [N,2] (already scaled by processor)
             buf_x, buf_y = [], []
-            for x, y in inner[bi]:             # x:[N,F], y:[N,Cu]
+            for x, y in inner[order_idx]:       # x:[N,F], y:[N,Cu]
                 buf_x.append(x)
                 buf_y.append(y)
                 if len(buf_x) == self.batch_size:
@@ -198,17 +212,34 @@ class WellH5SequentialDataProcessorMultiResDEMO(SequentialDataProcessor):
         coords_by_bucket_phys = []
         u_fields_t0 = None; u_fields_t1 = None
 
+        # Resolutions that should not have test splits (even if test directories exist)
+        # These resolutions only have train and valid splits
+        skip_test_resolutions = ["128x32", "256x256"]
+        
         for br in bucket_roots:
+            res_name = os.path.basename(br)
             sd_train = os.path.join(br, "data", "train")
             sd_val   = os.path.join(br, "data", "valid")
             sd_test  = os.path.join(br, "data", "test")
-            for sd in (sd_train, sd_val, sd_test):
+            
+            # Check train and valid directories
+            for sd in (sd_train, sd_val):
                 if not os.path.isdir(sd):
                     raise FileNotFoundError(f"Missing split directory: {sd}")
 
             split_dirs_by_bucket["train"].append(sd_train)
             split_dirs_by_bucket["val"].append(sd_val)
-            split_dirs_by_bucket["test"].append(sd_test)
+            
+            # Only add test split if not in skip list and directory exists
+            if res_name not in skip_test_resolutions:
+                if not os.path.isdir(sd_test):
+                    raise FileNotFoundError(f"Missing test directory for resolution {res_name}: {sd_test}")
+                split_dirs_by_bucket["test"].append(sd_test)
+            else:
+                # For resolutions that should skip test (128x32, 256x256), append None
+                # These will be filtered out when creating the test loader
+                split_dirs_by_bucket["test"].append(None)
+                print(f"[INFO] Skipping test split for resolution {res_name} (as configured)")
 
             tfiles = sorted(glob.glob(os.path.join(sd_train, "*.hdf5")))
             if not tfiles:
@@ -422,14 +453,23 @@ class WellH5SequentialDataProcessorMultiResDEMO(SequentialDataProcessor):
         meta = data_splits["_multi_meta"]
 
         def mk(split):
+            # Filter out None values for resolutions that should skip this split
+            bucket_dirs = [d for d in meta["buckets"][split] if d is not None]
+            if not bucket_dirs:
+                return None
+            # Filter coords to match the filtered buckets
+            coords_filtered = []
+            for idx, d in enumerate(meta["buckets"][split]):
+                if d is not None:
+                    coords_filtered.append(meta["coords_by_bucket"][idx])
             return _MultiResBatchIterableDEMO(
-                bucket_split_dirs=meta["buckets"][split],
+                bucket_split_dirs=bucket_dirs,
                 stats=self.stats,
                 time_step=meta["time_step"],
                 max_time_diff=meta["max_time_diff"],
                 u_fields_t0=meta["u_fields_t0"],
                 u_fields_t1=meta["u_fields_t1"],
-                coords_by_bucket=meta["coords_by_bucket"],   # already scaled
+                coords_by_bucket=coords_filtered,   # already scaled, filtered to match buckets
                 batch_size=self.dataset_config.batch_size,
                 cache_samples=getattr(self.dataset_config, "stream_cache_samples", 1),
                 shuffle_buckets=getattr(self.dataset_config, "shuffle", True),
@@ -445,12 +485,21 @@ class WellH5SequentialDataProcessorMultiResDEMO(SequentialDataProcessor):
             )
 
         loaders = {}
+        eval_split = getattr(self.dataset_config, "eval_split", "test")
         if getattr(self.dataset_config, "train", True):
-            loaders["train"] = make_loader(mk("train"))
-            loaders["val"]   = make_loader(mk("val"))
+            train_dataset = mk("train")
+            val_dataset = mk("val")
+            loaders["train"] = make_loader(train_dataset) if train_dataset is not None else None
+            loaders["val"]   = make_loader(val_dataset) if val_dataset is not None else None
         else:
             loaders["train"] = loaders["val"] = None
 
-        loaders["test"] = make_loader(mk("test"))
-        self.runtime_hints = {"use_trainer_autoreg": True}
+        if eval_split not in meta["buckets"]:
+            print(f"[WARN] Requested eval_split '{eval_split}' not available; falling back to 'test'")
+            eval_split = "test"
+
+        print(f"[STREAM] Using split '{eval_split}' for evaluation loader.")
+        test_dataset = mk(eval_split)
+        loaders["test"] = make_loader(test_dataset) if test_dataset is not None else None
+        self.runtime_hints = {"use_trainer_autoreg": True, "eval_split": eval_split}
         return loaders

@@ -35,8 +35,20 @@ wandb/
 data/
 perturbed_traj/
 perturbed_trajectories/
+sweeps/
+per_resolution_animations/
+
+# Large files
 *.zip
 *.hdf5
+*.nc
+*.npz
+*.png
+*.gif
+*.jpg
+*.jpeg
+*.mp4
+*.pt
 
 config/*
 !config/examples

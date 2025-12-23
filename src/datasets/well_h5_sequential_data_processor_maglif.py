@@ -93,7 +93,7 @@ class WellH5SequentialDataProcessorMagLIF(SequentialDataProcessor):
     """
     Data processor for 1D MagLIF dataset.
     - 1D radial coordinates only
-    - 9 fields: rho_Be, rho_DT, T_elec, T_ion, Vel, P_ion, P_elec, n_elec, bmag
+    - 12 fields: Rho, rho_Be, rho_DT, T_elec, T_ion, Rad_Temp, Vel, P_ion, P_elec, n_elec, bmag, jz
     - No conditioning (c) data
     - Streaming-based processing to handle large datasets
     """
@@ -127,19 +127,21 @@ class WellH5SequentialDataProcessorMagLIF(SequentialDataProcessor):
             all_fields = _list_field_datasets(h5, "fields")
             print(f"[MagLIF] Found {len(all_fields)} fields: {all_fields}")
             
-            # Define the field order we want (9 channels)
-            # Based on metadata: Rho, mat(1)%zeff, T_elec, T_ion, Vel, P_ion, P_elec, n_elec, bmag
+            # Define the field order we want (12 channels)
             # Map to actual HDF5 field names (exact match from file)
             field_mapping = [
                 "Rho",           # channel 0: total density
-                "mat(1)%zeff",   # channel 1: effective charge
-                "T_elec",        # channel 2: electron temperature
-                "T_ion",         # channel 3: ion temperature
-                "Vel",           # channel 4: velocity
-                "P_ion",         # channel 5: ion pressure
-                "P_elec",        # channel 6: electron pressure
-                "n_elec",        # channel 7: electron number density
-                "bmag",          # channel 8: magnetic field magnitude
+                "rho_Be",        # channel 1: beryllium density
+                "rho_DT",        # channel 2: DT density
+                "T_elec",        # channel 3: electron temperature
+                "T_ion",         # channel 4: ion temperature
+                "Rad_Temp",      # channel 5: radiation temperature
+                "Vel",           # channel 6: velocity
+                "P_ion",         # channel 7: ion pressure
+                "P_elec",        # channel 8: electron pressure
+                "n_elec",        # channel 9: electron number density
+                "bmag",          # channel 10: magnetic field magnitude
+                "jz",            # channel 11: current density
             ]
             
             # Verify all fields exist

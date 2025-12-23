@@ -11,14 +11,14 @@
 
     "model": {
         "name": "gaot",
-        "latent_tokens_size": [64],
+        "latent_tokens_size": [128],
         "use_conditional_norm": false,
         "args": {
             "magno": {
                 "coord_dim": 1,
-                "scales": [1],
+                "scales": [1, 2, 3],
                 "use_scale_weights": true,
-                "radius": 0.1,
+                "radius": 0.033,
                 "hidden_size": 64,
                 "mlp_layers": 3,
                 "lifting_channels": 64
@@ -43,7 +43,7 @@
         "max_time_diff": 4,
         "time_step": 4,
         "coord_scaling": "global_scaling",
-        "batch_size": 64,
+        "batch_size": 128,
         "num_workers": 0,
         "shuffle": true,
         "metric": "final_step",
@@ -67,10 +67,10 @@
     },
 
     "path": {
-        "ckpt_path": ".ckpt/examples/time_dep/maglif.pt",
-        "loss_path": ".loss/examples/time_dep/maglif.png",
-        "result_path": ".results/examples/time_dep/maglif.png",
-        "database_path": ".database/examples/time_dep/maglif.csv"
+        "ckpt_path": ".ckpt/examples/time_dep/maglif_v2.pt",
+        "loss_path": ".loss/examples/time_dep/maglif_v2.png",
+        "result_path": ".results/examples/time_dep/maglif_v2.png",
+        "database_path": ".database/examples/time_dep/maglif_v2.csv"
     },
 
     "wandb": {
@@ -78,7 +78,7 @@
         "project": "gaot-maglif",
         "entity": "Zenithon-AI",
         "group": "maglif",
-        "run_name": "GAOT_test_maglif",
+        "run_name": "GAOT_maglif_v2",
         "mode": "online",
         "tags": ["GAOT","DEMO"],
         "watch_log": "all",

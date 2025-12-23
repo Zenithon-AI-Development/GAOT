@@ -11,6 +11,7 @@ from main import prepare_arg
 from src.trainer.sequential_trainer import SequentialTrainer
 from src.trainer.static_trainer import StaticTrainer
 from src.utils.plotting import create_sequential_animation
+from src.utils.metrics import compute_batch_errors, compute_final_metric
 
 def set_mp_spawn():
     import torch.multiprocessing as mp
@@ -83,128 +84,156 @@ def build_time_indices_for_animation(max_time_steps, step=1):
     return np.arange(0, min(max_time_steps, 101), step, dtype=int)
 
 def evaluate_loader(loader, loader_name, model, trainer, device, max_samples, stats):
-    """Evaluate model on a single data loader and return resolution-grouped results"""
-    resolution_data = defaultdict(lambda: {
-        'preds': [],
-        'targets': [],
-        'inputs': [],
+    """Evaluate model on a single data loader and return resolution-grouped results."""
+    resolution_stats = defaultdict(lambda: {
+        'count': 0,
+        'sum_mse_norm': 0.0,
+        'sum_mse_den': 0.0,
+        'sum_rel1': 0.0,
+        'sum_rel2': 0.0,
+        'chunk_errors': [],
         'coord': None,
-        'count': 0
+        'sample_input': None,
+        'sample_target': None,
+        'sample_pred': None
     })
     
     print(f"\nCollecting predictions from {loader_name.upper()} set...")
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
-            if isinstance(batch, dict):
-                # Multi-res format: {"x": [B,N,C], "y": [B,N,C], "coord": [N,2]}
-                x_batch = batch["x"].to(device)
-                y_batch = batch["y"].to(device)
-                coord = batch["coord"].to(device)
-            else:
+            if not isinstance(batch, dict):
                 print("\nWARNING: Unexpected batch format. Expected dict with 'x', 'y', 'coord' keys.")
                 print("This might not be a multi-resolution dataset.")
                 break
             
+            x_batch = batch["x"].to(device)
+            y_batch = batch["y"].to(device)
+            coord = batch["coord"].to(device)
+            
             N = coord.shape[0]
             B = x_batch.shape[0]
             
-            # Check if we have enough samples for this resolution
-            if resolution_data[N]['count'] >= max_samples:
+            if max_samples > 0 and resolution_stats[N]['count'] >= max_samples:
                 continue
             
-            # Handle conditional normalization: drop last channel if enabled
-            # Multi-res format: x_batch = [u_norm | c_norm | start_time_norm | time_diff_norm]
             if getattr(trainer.model_config, 'use_conditional_norm', False):
-                # Conditional norm: pass all but last channel (time_diff is used as condition)
                 x_input = x_batch[..., :-1]
             else:
-                # Normal: pass all channels
                 x_input = x_batch
             
-            # Make prediction (one-step)
             pred = model(
                 latent_tokens_coord=trainer.latent_tokens_coord.to(device),
                 xcoord=coord,
                 pndata=x_input
             )
             
-            # Store results
-            resolution_data[N]['preds'].append(pred.cpu())
-            resolution_data[N]['targets'].append(y_batch.cpu())
-            resolution_data[N]['inputs'].append(x_batch.cpu())
-            if resolution_data[N]['coord'] is None:
-                resolution_data[N]['coord'] = coord.cpu()
-            resolution_data[N]['count'] += B
+            resolution_stats[N]['count'] += B
+            
+            mse_norm_per_sample = torch.mean((pred - y_batch) ** 2, dim=(-2, -1))
+            resolution_stats[N]['sum_mse_norm'] += mse_norm_per_sample.sum().item()
+            
+            u_mean = stats["u"]["mean"].to(device)
+            u_std = stats["u"]["std"].to(device)
+            pred_denorm = pred * u_std + u_mean
+            target_denorm = y_batch * u_std + u_mean
+            diff_denorm = pred_denorm - target_denorm
+            
+            mse_den_per_sample = torch.mean(diff_denorm ** 2, dim=(-2, -1))
+            resolution_stats[N]['sum_mse_den'] += mse_den_per_sample.sum().item()
+            
+            abs_diff = diff_denorm.abs().sum(dim=(-2, -1))
+            abs_target = target_denorm.abs().sum(dim=(-2, -1)).clamp_min(1e-12)
+            rel_l1_per_sample = abs_diff / abs_target
+            resolution_stats[N]['sum_rel1'] += rel_l1_per_sample.sum().item()
+            
+            l2_diff = torch.sqrt((diff_denorm ** 2).sum(dim=(-2, -1)))
+            l2_target = torch.sqrt((target_denorm ** 2).sum(dim=(-2, -1))).clamp_min(1e-12)
+            rel_l2_per_sample = l2_diff / l2_target
+            resolution_stats[N]['sum_rel2'] += rel_l2_per_sample.sum().item()
+            
+            rel_errors = compute_batch_errors(
+                target_denorm[:, None, :, :],
+                pred_denorm[:, None, :, :],
+                trainer.metadata
+            ).cpu()
+            resolution_stats[N]['chunk_errors'].append(rel_errors)
+            
+            if resolution_stats[N]['sample_input'] is None:
+                resolution_stats[N]['sample_input'] = x_batch[0:1].cpu()
+                resolution_stats[N]['sample_target'] = y_batch[0:1].cpu()
+                resolution_stats[N]['sample_pred'] = pred[0:1].detach().cpu()
+            if resolution_stats[N]['coord'] is None:
+                resolution_stats[N]['coord'] = coord.cpu()
             
             if (batch_idx + 1) % 10 == 0:
                 print(f"  Processed {batch_idx + 1} batches...")
     
-    if not resolution_data:
+    if not resolution_stats:
         print(f"  WARNING: No data collected from {loader_name} set")
         return None
     
-    print(f"  Found {len(resolution_data)} different resolutions in {loader_name} set")
+    print(f"  Found {len(resolution_stats)} different resolutions in {loader_name} set")
     
-    # Compute metrics per resolution
     results = []
     total_samples = 0
     weighted_rel_l1 = 0.0
     weighted_rel_l2 = 0.0
     weighted_mse = 0.0
     weighted_mse_norm = 0.0
+    overall_chunk_errors = []
     
-    for N in sorted(resolution_data.keys()):
-        data = resolution_data[N]
+    for N in sorted(resolution_stats.keys()):
+        data = resolution_stats[N]
+        num_samples = data['count']
+        if num_samples == 0:
+            continue
         
-        # Concatenate all predictions and targets for this resolution
-        all_preds_norm = torch.cat(data['preds'], dim=0)  # Normalized predictions
-        all_targets_norm = torch.cat(data['targets'], dim=0)  # Normalized targets
+        mse_norm = data['sum_mse_norm'] / num_samples
+        mse_den = data['sum_mse_den'] / num_samples
+        rel_l1 = data['sum_rel1'] / num_samples
+        rel_l2 = data['sum_rel2'] / num_samples
+        
+        if data['chunk_errors']:
+            chunk_errors = torch.cat(data['chunk_errors'], dim=0)
+            overall_chunk_errors.append(chunk_errors)
+            gaot_rel = compute_final_metric(chunk_errors)
+        else:
+            gaot_rel = float('nan')
+        
         coord = data['coord']
-        
-        # Compute normalized MSE (matches training validation loss)
-        mse_norm = compute_metrics_normalized(all_preds_norm, all_targets_norm)
-        
-        # Denormalize for other metrics
-        u_mean = stats["u"]["mean"].cpu()
-        u_std = stats["u"]["std"].cpu()
-        all_preds_denorm = all_preds_norm * u_std + u_mean
-        all_targets_denorm = all_targets_norm * u_std + u_mean
-        
-        # Compute metrics on denormalized data
-        metrics = compute_metrics(all_preds_denorm, all_targets_denorm)
-        
-        # Get resolution label
         res_label = get_resolution_label(N, coord)
         
-        # Accumulate for overall metrics (weighted average by number of samples)
-        num_samples = all_preds_norm.shape[0]
         total_samples += num_samples
-        weighted_rel_l1 += metrics['rel_l1'] * num_samples
-        weighted_rel_l2 += metrics['rel_l2'] * num_samples
-        weighted_mse += metrics['mse'] * num_samples
+        weighted_rel_l1 += rel_l1 * num_samples
+        weighted_rel_l2 += rel_l2 * num_samples
+        weighted_mse += mse_den * num_samples
         weighted_mse_norm += mse_norm * num_samples
         
-        # Store for results
         results.append({
             'dataset': loader_name,
             'resolution': res_label,
             'N_points': N,
             'num_samples': num_samples,
             'mse_normalized': mse_norm,
-            'rel_l1': metrics['rel_l1'],
-            'rel_l2': metrics['rel_l2'],
-            'mse': metrics['mse']
+            'rel_l1': rel_l1,
+            'rel_l2': rel_l2,
+            'mse': mse_den,
+            'gaot_rel_l1': gaot_rel
         })
     
-    # Compute overall metrics as weighted average across resolutions
     if total_samples > 0:
         overall_mse_norm = weighted_mse_norm / total_samples
         overall_rel_l1 = weighted_rel_l1 / total_samples
         overall_rel_l2 = weighted_rel_l2 / total_samples
         overall_mse = weighted_mse / total_samples
+        if overall_chunk_errors:
+            overall_chunk_errors = torch.cat(overall_chunk_errors, dim=0)
+            overall_gaot_rel = compute_final_metric(overall_chunk_errors)
+        else:
+            overall_gaot_rel = float('nan')
     else:
-        overall_mse_norm = overall_rel_l1 = overall_rel_l2 = overall_mse = float('nan')
+        overall_mse_norm = overall_rel_l1 = overall_rel_l2 = overall_mse = overall_gaot_rel = float('nan')
     
     results.append({
         'dataset': loader_name,
@@ -214,10 +243,11 @@ def evaluate_loader(loader, loader_name, model, trainer, device, max_samples, st
         'mse_normalized': overall_mse_norm,
         'rel_l1': overall_rel_l1,
         'rel_l2': overall_rel_l2,
-        'mse': overall_mse
+        'mse': overall_mse,
+        'gaot_rel_l1': overall_gaot_rel
     })
     
-    return resolution_data, results
+    return resolution_stats, results
 
 def main():
     set_mp_spawn()
@@ -226,7 +256,7 @@ def main():
     ap.add_argument("-c", "--config", required=True, help="Path to config file")
     ap.add_argument("--device", default="cuda:0", help="Device to use")
     ap.add_argument("--batch", type=int, default=4, help="Batch size")
-    ap.add_argument("--max_samples", type=int, default=100, help="Max samples to evaluate per resolution")
+    ap.add_argument("--max_samples", type=int, default=0, help="Cap samples per resolution (0 = use all)")
     ap.add_argument("--max_rollout_steps", type=int, default=50, help="Max autoregressive rollout steps for animation")
     ap.add_argument("--out_csv", default="per_resolution_metrics.csv", help="Output CSV file")
     ap.add_argument("--animation_dir", default="per_resolution_animations", help="Directory to save animations")
@@ -286,8 +316,9 @@ def main():
     print(f"\nWill evaluate on: {', '.join([name.upper() for _, name in loaders_to_eval])}")
     print("(Batches never mix resolutions in multi-res setup)\n")
     
-    # Store resolution data for animation (use validation data)
+    # Store resolution data for animation (prefer validation set)
     val_resolution_data = None
+    last_resolution_data = None
     
     for loader, loader_name in loaders_to_eval:
         print("=" * 60)
@@ -295,6 +326,7 @@ def main():
         
         if result is not None:
             resolution_data, results = result
+            last_resolution_data = resolution_data
             
             # Save validation data for animations
             if loader_name == "validation":
@@ -311,6 +343,7 @@ def main():
                     print(f"  Relative L1 (denormalized): {res_dict['rel_l1']:.6f}")
                     print(f"  Relative L2 (denormalized): {res_dict['rel_l2']:.6f}")
                     print(f"  MSE (denormalized): {res_dict['mse']:.6e}")
+                    print(f"  GAOT relative L1 (trainer metric): {res_dict.get('gaot_rel_l1', float('nan')):.6f}")
                 else:
                     print(f"\nResolution: {res_dict['resolution']} (N={res_dict['N_points']})")
                     print(f"  Samples: {res_dict['num_samples']}")
@@ -318,6 +351,7 @@ def main():
                     print(f"  Relative L1 (denormalized): {res_dict['rel_l1']:.6f}")
                     print(f"  Relative L2 (denormalized): {res_dict['rel_l2']:.6f}")
                     print(f"  MSE (denormalized): {res_dict['mse']:.6e}")
+                    print(f"  GAOT relative L1 (trainer metric): {res_dict.get('gaot_rel_l1', float('nan')):.6f}")
             
             all_results.extend(results)
         else:
@@ -327,8 +361,8 @@ def main():
         print("\nERROR: No results collected from any dataset")
         return
     
-    # Use validation data for animations (guaranteed to exist for all resolutions)
-    resolution_data = val_resolution_data if val_resolution_data is not None else resolution_data
+    # Use validation data for animations when available (matches training visuals)
+    animation_data = val_resolution_data if val_resolution_data is not None else last_resolution_data
     
     # Save CSV results (includes both validation and test if available)
     os.makedirs(os.path.dirname(args.out_csv) or ".", exist_ok=True)
@@ -338,112 +372,91 @@ def main():
     
     # Generate animations per resolution
     if not args.skip_animations:
-        print("\n" + "="*60)
-        print("Generating animations per resolution...")
-        print("="*60)
-        
-        os.makedirs(args.animation_dir, exist_ok=True)
-        
-        # Build time indices for autoregressive rollout
-        # Use dataset config to determine appropriate time step
-        time_step = int(getattr(trainer.dataset_config, 'time_step', 1))
-        time_indices = build_time_indices_for_animation(args.max_rollout_steps, step=time_step)
-        
-        # Subsample to use only every 10th frame for animation
-        time_indices_anim = time_indices[::10]
-        print(f"Using {len(time_indices_anim)} frames for animations (every 10th frame from {len(time_indices)} total steps)")
-        
-        for N in sorted(resolution_data.keys()):
-            data = resolution_data[N]
-            coord = data['coord'].to(device)
-            res_label = get_resolution_label(N, coord)
+        if animation_data is None:
+            print("\nNo resolution data available for animations; skipping.")
+        else:
+            print("\n" + "="*60)
+            print("Generating animations per resolution...")
+            print("="*60)
             
-            print(f"\nCreating animation for resolution: {res_label}")
+            os.makedirs(args.animation_dir, exist_ok=True)
             
-            # Take first sample from this resolution for animation
-            all_inputs = torch.cat(data['inputs'], dim=0)
-            first_input_full = all_inputs[0:1].to(device)  # [1, N, C_full] with all features
+            time_step = int(getattr(trainer.dataset_config, 'time_step', 1))
+            time_indices = build_time_indices_for_animation(args.max_rollout_steps, step=time_step)
+            time_indices_anim = time_indices[::10]
+            print(f"Using {len(time_indices_anim)} frames for animations (every 10th frame from {len(time_indices)} total steps)")
             
-            # For autoregressive_predict, we need ONLY u and c fields (no time features)
-            # The autoregressive_predict method will add time features internally
-            u_dim = stats["u"]["mean"].shape[-1]
-            c_dim = stats["c"]["mean"].shape[-1] if "c" in stats else 0
-            first_input = first_input_full[..., :u_dim+c_dim]  # [1, N, u_dim+c_dim]
-            
-            try:
-                # Generate autoregressive prediction sequence
-                with torch.no_grad():
-                    pred_sequence = model.autoregressive_predict(
-                        x_batch=first_input,
-                        time_indices=time_indices,
-                        t_values=trainer.t_values if hasattr(trainer, 't_values') else np.arange(len(time_indices)),
-                        stats=stats,
-                        stepper_mode=getattr(trainer.dataset_config, 'stepper_mode', 'output'),
-                        latent_tokens_coord=trainer.latent_tokens_coord.to(device),
-                        fixed_coord=coord,
-                        encoder_nbrs=None,
-                        decoder_nbrs=None,
-                        use_conditional_norm=getattr(trainer.model_config, 'use_conditional_norm', False)
-                    )  # [1, T-1, N, C]
+            for N in sorted(animation_data.keys()):
+                data = animation_data[N]
+                coord = data['coord'].to(device)
+                res_label = get_resolution_label(N, coord)
                 
-                # Denormalize predictions
-                u_mean = stats["u"]["mean"].cpu()
-                u_std = stats["u"]["std"].cpu()
-                pred_denorm = pred_sequence[0].cpu() * u_std + u_mean  # [T-1, N, C]
+                print(f"\nCreating animation for resolution: {res_label}")
                 
-                # For ground truth, we would need the full trajectory
-                # Since we only have one-step targets, we'll use pred_denorm as both GT and pred
-                # This shows the autoregressive drift over time
-                # In a real scenario, you'd load the full GT trajectory from the dataset
-                gt_denorm = pred_denorm.clone()
+                first_input_full = data['sample_input'].to(device)  # [1, N, C_full]
+                u_channels = stats["u"]["mean"].shape[-1]
+                c_channels = stats["c"]["mean"].shape[-1] if "c" in stats else 0
+                first_input = first_input_full[..., :u_channels + c_channels]
                 
-                # Get input data (denormalized)
-                # stats["u"]["mean"] has shape [1, C], so use shape[-1] to get C
-                u_dim = stats["u"]["mean"].shape[-1]
-                input_denorm = (first_input[0, :, :u_dim].cpu() * u_std + u_mean).numpy()  # [N, C]
-                
-                # Inverse transform coordinates to physical space
-                coord_phys = trainer.data_processor.coord_scaler.inverse_transform(coord.cpu()).numpy()
-                
-                # Subsample frames for animation (every 10th frame)
-                gt_anim = gt_denorm[::10].numpy()  # [T_anim, N, C]
-                pred_anim = pred_denorm[::10].numpy()  # [T_anim, N, C]
-                
-                # Get time values for labels
-                if hasattr(trainer, 't_values'):
-                    t_vals = trainer.t_values
-                    time_values = [float(t_vals[idx]) for idx in time_indices_anim]
-                else:
-                    time_values = [float(idx) for idx in time_indices_anim]
-                
-                # Create animation
-                animation_path = os.path.join(args.animation_dir, f"animation_{res_label}.gif")
-                
-                create_sequential_animation(
-                    gt_sequence=gt_anim,
-                    pred_sequence=pred_anim,
-                    coords=coord_phys,
-                    save_path=animation_path,
-                    input_data=input_denorm,
-                    time_values=time_values,
-                    interval=100,  # 100ms per frame
-                    symmetric=trainer.metadata.signed['u'] if hasattr(trainer.metadata, 'signed') else [True],
-                    domain=trainer.metadata.domain_x if hasattr(trainer.metadata, 'domain_x') else None,
-                    names=trainer.metadata.names.get('u', None) if hasattr(trainer.metadata, 'names') else None,
-                    colorbar_type="light",
-                    show_error=True,
-                    dynamic_colorscale=True,
-                    u_mean=u_mean.numpy(),
-                    u_std=u_std.numpy()
-                )
-                
-                print(f"  Saved animation to: {animation_path}")
-                print(f"  Animation frames: {gt_anim.shape[0]}")
-                
-            except Exception as e:
-                print(f"  WARNING: Could not create animation for {res_label}: {e}")
-                import traceback
-                traceback.print_exc()
+                try:
+                    with torch.no_grad():
+                        pred_sequence = model.autoregressive_predict(
+                            x_batch=first_input,
+                            time_indices=time_indices,
+                            t_values=trainer.t_values if hasattr(trainer, 't_values') else np.arange(len(time_indices)),
+                            stats=stats,
+                            stepper_mode=getattr(trainer.dataset_config, 'stepper_mode', 'output'),
+                            latent_tokens_coord=trainer.latent_tokens_coord.to(device),
+                            fixed_coord=coord,
+                            encoder_nbrs=None,
+                            decoder_nbrs=None,
+                            use_conditional_norm=getattr(trainer.model_config, 'use_conditional_norm', False)
+                        )  # [1, T-1, N, C]
+                    
+                    u_mean = stats["u"]["mean"].cpu()
+                    u_std = stats["u"]["std"].cpu()
+                    pred_denorm = pred_sequence[0].cpu() * u_std + u_mean  # [T-1, N, C]
+                    gt_denorm = pred_denorm.clone()
+                    
+                    input_denorm = (first_input[0, :, :u_channels].cpu() * u_std + u_mean).numpy()
+                    coord_phys = trainer.data_processor.coord_scaler.inverse_transform(coord.cpu()).numpy()
+                    
+                    gt_anim = gt_denorm[::10].numpy()
+                    pred_anim = pred_denorm[::10].numpy()
+                    
+                    if hasattr(trainer, 't_values'):
+                        t_vals = trainer.t_values
+                        time_values = [float(t_vals[idx]) for idx in time_indices_anim]
+                    else:
+                        time_values = [float(idx) for idx in time_indices_anim]
+                    
+                    animation_path = os.path.join(args.animation_dir, f"animation_{res_label}.gif")
+                    
+                    create_sequential_animation(
+                        gt_sequence=gt_anim,
+                        pred_sequence=pred_anim,
+                        coords=coord_phys,
+                        save_path=animation_path,
+                        input_data=input_denorm,
+                        time_values=time_values,
+                        interval=100,
+                        symmetric=trainer.metadata.signed['u'] if hasattr(trainer.metadata, 'signed') else [True],
+                        domain=trainer.metadata.domain_x if hasattr(trainer.metadata, 'domain_x') else None,
+                        names=trainer.metadata.names.get('u', None) if hasattr(trainer.metadata, 'names') else None,
+                        colorbar_type="light",
+                        show_error=True,
+                        dynamic_colorscale=True,
+                        u_mean=u_mean.numpy(),
+                        u_std=u_std.numpy()
+                    )
+                    
+                    print(f"  Saved animation to: {animation_path}")
+                    print(f"  Animation frames: {gt_anim.shape[0]}")
+                    
+                except Exception as e:
+                    print(f"  WARNING: Could not create animation for {res_label}: {e}")
+                    import traceback
+                    traceback.print_exc()
     
     print("\n" + "="*60)
     print("SUMMARY:")

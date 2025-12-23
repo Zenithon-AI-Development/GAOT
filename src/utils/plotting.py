@@ -861,7 +861,8 @@ def create_sequential_animation_1d(
     show_error: bool = True,
     u_mean: np.ndarray = None,
     u_std: np.ndarray = None,
-    max_frames: int = 300
+    max_frames: int = 300,
+    metadata: Optional[object] = None
 ):
     """
     Create animated line plots for 1D sequential data.
@@ -982,8 +983,37 @@ def create_sequential_animation_1d(
             if ivar == n_channels - 1:
                 ax_err.set_xlabel('Position', fontsize=9)
     
-    # Add time text
+    # Add time text and error text
     time_text = fig.suptitle('', fontsize=12, fontweight='bold')
+    error_text = None
+    
+    # For 1D/maglif: compute GAOT relative error if metadata is provided
+    if metadata is not None and u_mean is not None and u_std is not None:
+        # Compute GAOT relative error for the entire sequence (matching compute_batch_errors method)
+        import torch
+        # Convert to torch tensors
+        gt_torch = torch.from_numpy(gt_sequence).float()  # [T, N, C]
+        pred_torch = torch.from_numpy(pred_sequence).float()  # [T, N, C]
+        
+        # Re-normalize using metadata stats (like compute_batch_errors does)
+        metadata_mean = torch.tensor(metadata.global_mean, dtype=torch.float32).reshape(1, 1, -1)
+        metadata_std = torch.tensor(metadata.global_std, dtype=torch.float32).reshape(1, 1, -1)
+        
+        # Re-normalize using metadata stats
+        gt_renorm = (gt_torch - metadata_mean) / metadata_std  # [T, N, C]
+        pred_renorm = (pred_torch - metadata_mean) / metadata_std  # [T, N, C]
+        
+        # Compute GAOT relative error: sum(|error|) / sum(|gt|) across all channels and space
+        abs_error = torch.abs(pred_renorm - gt_renorm)  # [T, N, C]
+        abs_gt = torch.abs(gt_renorm)  # [T, N, C]
+        total_error = abs_error.sum().item()
+        total_gt = abs_gt.sum().item()
+        gaot_rel_error = (total_error / (total_gt + 1e-10)) * 100.0  # Convert to percentage
+        
+        # Create error text that will be displayed
+        error_text = fig.text(0.5, 0.02, f'GAOT Relative Error: {gaot_rel_error:.2f}%', 
+                             ha='center', fontsize=11, fontweight='bold', 
+                             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
     
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     
@@ -1008,7 +1038,10 @@ def create_sequential_animation_1d(
                 error = np.abs(gt_sequence[frame, :, ivar] - pred_sequence[frame, :, ivar])
                 lines['error'][ivar].set_ydata(error)
         
-        return [time_text] + lines['gt'] + lines['pred'] + (lines['error'] if show_error else [])
+        return_list = [time_text] + lines['gt'] + lines['pred'] + (lines['error'] if show_error else [])
+        if error_text is not None:
+            return_list.append(error_text)
+        return return_list
     
     # Create animation with memory-efficient settings
     anim = animation.FuncAnimation(

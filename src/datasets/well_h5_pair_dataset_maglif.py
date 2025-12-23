@@ -82,7 +82,7 @@ def _read_field_TNC(h5: h5py.File, group: str, field: str, T_hint: Optional[int]
 class WellH5PairIterableMagLIF(IterableDataset):
     """
     Streams (x_in, y) pairs for MagLIF 1D dataset.
-    - Handles 9 channels from fields: rho_Be, rho_DT, T_elec, T_ion, Vel, P_ion, P_elec, n_elec, bmag
+    - Handles 12 channels from fields: Rho, rho_Be, rho_DT, T_elec, T_ion, Rad_Temp, Vel, P_ion, P_elec, n_elec, bmag, jz
     - Uses true time values for time features
     - 1D radial coordinates only
     """
@@ -165,6 +165,12 @@ class WellH5PairIterableMagLIF(IterableDataset):
         # Extract stats
         u_mean = self.stats["u"]["mean"].reshape(1, -1)  # [1, Cu]
         u_std  = self.stats["u"]["std"].reshape(1, -1)
+        # if not hasattr(self, "_norm_debug_printed"):
+        #     self._norm_debug_printed = True
+        #     print(f"[DEBUG DATASET] Normalization in dataset __iter__:")
+        #     print(f"  u_mean shape: {u_mean.shape}, first 3 values: {u_mean.flatten()[:3].tolist()}")
+        #     print(f"  u_std shape: {u_std.shape}, first 3 values: {u_std.flatten()[:3].tolist()}")
+        #     print(f"  Stats come from self.stats (computed from training data)")
 
         st_mu = float(self.stats["start_time"]["mean"])
         st_sd = float(self.stats["start_time"]["std"])
@@ -183,6 +189,14 @@ class WellH5PairIterableMagLIF(IterableDataset):
                 # Normalize u
                 u_in_norm = (u_in - u_mean) / u_std
                 y         = (u_out - u_mean) / u_std
+                # if not hasattr(self, "_first_sample_printed"):
+                #     self._first_sample_printed = True
+                #     print(f"[DEBUG DATASET] First sample normalization check:")
+                #     print(f"  u_out (raw) first 3 values: {u_out[0, :3].tolist()}")
+                #     print(f"  u_mean first 3: {u_mean[0, :3].tolist()}")
+                #     print(f"  u_std first 3: {u_std[0, :3].tolist()}")
+                #     print(f"  y (normalized) first 3 values: {y[0, :3].tolist()}")
+                #     print(f"  y stats: min={y.min():.6f}, max={y.max():.6f}, mean={y.mean():.6f}, std={y.std():.6f}")
 
                 # Compute time features from true time values
                 start_t = float(t_vals[i])

@@ -67,10 +67,10 @@
     },
 
     "path": {
-        "ckpt_path": ".ckpt/examples/time_dep/demo/demo_multires_small_new.pt",
-        "loss_path": ".loss/examples/time_dep/demo/demo_multires_small_new.png",
-        "result_path": ".results/examples/time_dep/demo/demo_multires_small_new.png",
-        "database_path": ".database/examples/time_dep/demo/demo_multires_small_new.csv"
+        "ckpt_path": ".ckpt/examples/time_dep/demo/demo_multires_small_new_.pt",
+        "loss_path": ".loss/examples/time_dep/demo/demo_multires_small_new_.png",
+        "result_path": ".results/examples/time_dep/demo/demo_multires_small_new_.png",
+        "database_path": ".database/examples/time_dep/demo/demo_multires_small_new_.csv"
     },
 
     "wandb": {

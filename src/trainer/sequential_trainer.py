@@ -111,6 +111,7 @@ class SequentialTrainer(BaseTrainer):
         self.t_values = self.data_processor.t_values
         self.stats = self.data_processor.stats
         # If we're using a streaming HDF5 backend, align metadata stats with loader stats
+        # This happens regardless of train/test flag - stats are always computed from training data
         _backend = getattr(self.dataset_config, "backend", "netcdf").lower()
         if _backend in ("well", "well_multires", "well_maglif", "generic_h5"):
             if self.stats is not None and "u" in self.stats:
@@ -120,6 +121,25 @@ class SequentialTrainer(BaseTrainer):
                 self.metadata.global_mean = mu.tolist()
                 self.metadata.global_std  = sd.tolist()
                 # (chunk mapping already handled by Metadata.active_variables/chunked_variables)
+                train_flag = getattr(self.setup_config, "train", True)
+                # print(f"[DEBUG NORM] Overwriting metadata stats with real stats from data processor (train={train_flag})")
+                # print(f"[DEBUG NORM] self.stats['u']['mean'] shape: {self.stats['u']['mean'].shape}, first 3 values: {self.stats['u']['mean'].flatten()[:3].tolist()}")
+                # print(f"[DEBUG NORM] self.stats['u']['std'] shape: {self.stats['u']['std'].shape}, first 3 values: {self.stats['u']['std'].flatten()[:3].tolist()}")
+                # print(f"[DEBUG NORM] metadata.global_mean length: {len(self.metadata.global_mean)}, first 3 values: {self.metadata.global_mean[:3]}")
+                # print(f"[DEBUG NORM] metadata.global_std length: {len(self.metadata.global_std)}, first 3 values: {self.metadata.global_std[:3]}")
+                # Verify stats were computed (should always be available, even when train=False)
+                if self.stats is None:
+                    # print(f"[DEBUG NORM] WARNING: self.stats is None! This should not happen.")
+                    pass
+                elif "u" not in self.stats:
+                    # print(f"[DEBUG NORM] WARNING: self.stats['u'] is missing! Available keys: {list(self.stats.keys())}")
+                    pass
+            else:
+                # print(f"[DEBUG NORM] WARNING: Cannot overwrite metadata stats - self.stats is None or missing 'u' key")
+                pass
+                # print(f"  self.stats is None: {self.stats is None}")
+                # if self.stats is not None:
+                #     print(f"  Available keys in self.stats: {list(self.stats.keys())}")
 
         
         self.bucket_coords = getattr(self.data_processor, "bucket_coords_scaled", None)  # dict or None
@@ -343,10 +363,22 @@ class SequentialTrainer(BaseTrainer):
     def _train_step_fixed_coords(self, batch):
         """Training step for fixed coordinates mode."""
         # allow (x, y) or (x, y, coord)
+        # if not hasattr(self, "_batch_structure_debugged"):
+        #     self._batch_structure_debugged = True
+        #     print(f"\n[DEBUG BATCH STRUCTURE] Raw batch type: {type(batch)}")
+        #     if isinstance(batch, (tuple, list)):
+        #         print(f"  Batch length: {len(batch)}")
+        #         for i, item in enumerate(batch[:3]):  # First 3 items
+        #             print(f"  Item {i} type: {type(item)}, shape: {item.shape if hasattr(item, 'shape') else 'N/A'}")
+        
         x_batch, y_batch, coord = self._unpack_batch_fx_any(batch)
-        if not hasattr(self, "_dbg_once"):
-            self._dbg_once = True
-            print(f"[DBG] x {tuple(x_batch.shape)}  y {tuple(y_batch.shape)}  coord {tuple(coord.shape)}")
+        # if not hasattr(self, "_dbg_once"):
+        #     self._dbg_once = True
+        #     print(f"[DBG] After unpack: x {tuple(x_batch.shape)}  y {tuple(y_batch.shape)}  coord {tuple(coord.shape)}")
+        #     print(f"[DBG] x_batch dtype: {x_batch.dtype}, device: {x_batch.device}")
+        #     print(f"[DBG] y_batch dtype: {y_batch.dtype}, device: {y_batch.device}")
+        #     print(f"[DBG] x_batch stats: min={x_batch.min().item():.6f}, max={x_batch.max().item():.6f}, mean={x_batch.mean().item():.6f}, std={x_batch.std().item():.6f}")
+        #     print(f"[DBG] y_batch stats: min={y_batch.min().item():.6f}, max={y_batch.max().item():.6f}, mean={y_batch.mean().item():.6f}, std={y_batch.std().item():.6f}")
 
         # x_batch, y_batch = batch
         x_batch = x_batch.to(self.device)
@@ -395,8 +427,44 @@ class SequentialTrainer(BaseTrainer):
         #     dt = x_batch[..., -1].mean().item()
         #     print(f"[SANITY] start_time (norm) ~{st:.4f}  time_diff (norm) ~{dt:.4f}")
 
+        loss_train = self.loss_fn(pred, y_batch)
+        # Print training loss every 10 batches to track learning
+        if not hasattr(self, "_train_batch_count"):
+            self._train_batch_count = 0
+        self._train_batch_count += 1
         
-        return self.loss_fn(pred, y_batch)
+        # if self._train_batch_count <= 3 or self._train_batch_count % 50 == 0:
+        #     print(f"[TRAIN BATCH {self._train_batch_count}] loss={loss_train.item():.6f}, pred_mean={pred.mean().item():.6f}, y_mean={y_batch.mean().item():.6f}")
+        
+        # if not hasattr(self, "_train_loss_debug_printed"):
+        #     self._train_loss_debug_printed = True
+        #     print(f"\n[DEBUG TRAIN] Training loss computation (first batch):")
+        #     print(f"  pred shape: {pred.shape}, y_batch shape: {y_batch.shape}")
+        #     print(f"  pred stats (normalized): min={pred.min().item():.6f}, max={pred.max().item():.6f}, mean={pred.mean().item():.6f}, std={pred.std().item():.6f}")
+        #     print(f"  y_batch stats (normalized): min={y_batch.min().item():.6f}, max={y_batch.max().item():.6f}, mean={y_batch.mean().item():.6f}, std={y_batch.std().item():.6f}")
+        #     print(f"  loss_train: {loss_train.item():.6f}")
+        #     print(f"  self.loss_fn type: {type(self.loss_fn)}, reduction: {getattr(self.loss_fn, 'reduction', 'N/A')}")
+        #     # Check if data is actually normalized (should have mean ~0, std ~1)
+        #     print(f"  y_batch normalized check: mean={y_batch.mean().item():.6f}, std={y_batch.std().item():.6f} (should be ~0 and ~1)")
+        #     print(f"  pred normalized check: mean={pred.mean().item():.6f}, std={pred.std().item():.6f}")
+        #     # Compute MSE manually to verify
+        #     mse_manual = ((pred - y_batch) ** 2).mean().item()
+        #     print(f"  MSE manual computation: {mse_manual:.6f} (should match loss_train)")
+        #     print(f"  Using stats from self.stats: mean shape={self.stats['u']['mean'].shape}, first 3={self.stats['u']['mean'].flatten()[:3].tolist()}")
+        #     print(f"  metadata.global_mean (should match): first 3={self.metadata.global_mean[:3]}")
+        #     print(f"  metadata.global_std (should match): first 3={self.metadata.global_std[:3]}")
+        #     # Check if stats match
+        #     stats_mean_tensor = self.stats['u']['mean'].flatten().cpu()
+        #     stats_std_tensor = self.stats['u']['std'].flatten().cpu()
+        #     metadata_mean_tensor = torch.tensor(self.metadata.global_mean, dtype=self.dtype)
+        #     metadata_std_tensor = torch.tensor(self.metadata.global_std, dtype=self.dtype)
+        #     mean_match = torch.allclose(stats_mean_tensor, metadata_mean_tensor, atol=1e-5)
+        #     std_match = torch.allclose(stats_std_tensor, metadata_std_tensor, atol=1e-5)
+        #     print(f"  Stats match check: mean={mean_match}, std={std_match}")
+        #     if not mean_match or not std_match:
+        #         print(f"    WARNING: Stats mismatch detected during training!")
+        
+        return loss_train
 
     def _train_step_variable_coords(self, batch):
         """Training step for variable coordinates mode."""
@@ -485,8 +553,25 @@ class SequentialTrainer(BaseTrainer):
         # print(f"[SANITY] pred μσ: {pred.mean().item():.5f} {pred.std().item():.5f} | "
         #     f"y μσ: {y_batch.mean().item():.5f} {y_batch.std().item():.5f}")
 
-        
-        return self.loss_fn(pred, y_batch)
+        loss_val = self.loss_fn(pred, y_batch)
+        # if not hasattr(self, "_val_loss_debug_printed"):
+        #     self._val_loss_debug_printed = True
+        #     print(f"\n[DEBUG VAL] Validation loss computation (first batch):")
+        #     print(f"  pred shape: {pred.shape}, y_batch shape: {y_batch.shape}")
+        #     print(f"  pred stats (normalized): min={pred.min().item():.6f}, max={pred.max().item():.6f}, mean={pred.mean().item():.6f}, std={pred.std().item():.6f}")
+        #     print(f"  y_batch stats (normalized): min={y_batch.min().item():.6f}, max={y_batch.max().item():.6f}, mean={y_batch.mean().item():.6f}, std={y_batch.std().item():.6f}")
+        #     print(f"  loss_val: {loss_val.item():.6f}")
+        #     print(f"  self.loss_fn type: {type(self.loss_fn)}")
+        #     # Check if data is actually normalized (should have mean ~0, std ~1)
+        #     print(f"  y_batch normalized check: mean={y_batch.mean().item():.6f}, std={y_batch.std().item():.6f} (should be ~0 and ~1)")
+        #     print(f"  pred normalized check: mean={pred.mean().item():.6f}, std={pred.std().item():.6f}")
+        #     # Compute MSE manually to verify
+        #     mse_manual = ((pred - y_batch) ** 2).mean().item()
+        #     print(f"  MSE manual computation: {mse_manual:.6f} (should match loss_val)")
+        #     print(f"  Using stats from self.stats: mean shape={self.stats['u']['mean'].shape}, first 3={self.stats['u']['mean'].flatten()[:3].tolist()}")
+        #     print(f"  metadata.global_mean (should match): first 3={self.metadata.global_mean[:3]}")
+        #     print(f"  metadata.global_std (should match): first 3={self.metadata.global_std[:3]}")
+        return loss_val
     
     def _validate_variable_coords(self, batch):
         """Validation step for variable coordinates."""
@@ -677,6 +762,109 @@ class SequentialTrainer(BaseTrainer):
                 raise ValueError(f"Unsupported stepper_mode: {self.stepper_mode}")
 
             preds_denorm.append(u_next)                   # [B, N, Cu]
+
+            # Rebuild normalized features to feed the next step
+            u_next_norm = (u_next - u_mean) / u_std
+            if Cc > 0:
+                x_curr = torch.cat([u_next_norm, x_curr[..., Cu:Cu+Cc], tfb], dim=-1)
+            else:
+                x_curr = torch.cat([u_next_norm, tfb], dim=-1)
+
+        return torch.stack(preds_denorm, dim=1) if preds_denorm else torch.empty(B, 0, N, Cu, device=device)
+    
+    def _autoregressive_predict_trainer_side_with_coord(self, x0, time_indices, coord):
+        """
+        Trainer-side AR rollout with custom coordinates (for per-resolution evaluation).
+        - x0: [B, N, Cu(+Cc)+2] (two dummy time features in the last dims)
+        - coord: [N, 2] (resolution-specific coordinates)
+        - returns denormalized u predictions [B, K, N, Cu], where K=len(time_indices)-1
+        """
+        self.model.eval()
+        device = self.device
+
+        # Current state (normalized features coming from TestDataset)
+        x_curr = x0.to(device)                    # [B, N, F]
+        B, N, F = x_curr.shape
+        
+        # Ensure coord is on device and correct shape
+        coord = coord.to(device)  # [N, 2]
+
+        # Stats
+        u_mean = self.stats["u"]["mean"].to(device)   # [1, Cu]
+        u_std  = self.stats["u"]["std"].to(device)    # [1, Cu]
+        Cu = u_mean.shape[-1]
+        Cc = int(self.stats["c"]["mean"].shape[-1]) if "c" in self.stats else 0
+
+        res_m = self.stats.get("res", {}).get("mean", None)
+        res_s = self.stats.get("res", {}).get("std",  None)
+        der_m = self.stats.get("der", {}).get("mean", None)
+        der_s = self.stats.get("der", {}).get("std",  None)
+        if res_m is not None: res_m = res_m.to(device)
+        if res_s is not None: res_s = res_s.to(device)
+        if der_m is not None: der_m = der_m.to(device)
+        if der_s is not None: der_s = der_s.to(device)
+
+        st_mu = float(self.stats["start_time"]["mean"])
+        st_sd = float(self.stats["start_time"]["std"])
+        dt_mu = float(self.stats["time_diffs"]["mean"])
+        dt_sd = float(self.stats["time_diffs"]["std"])
+
+        latent_tokens_coord = self.latent_tokens_coord.to(device)
+        
+        def time_feats(i_prev, i_curr):
+            t_prev = float(self.t_values[i_prev])
+            t_diff = float(self.t_values[i_curr] - self.t_values[i_prev])
+            st = (t_prev - st_mu) / (st_sd if st_sd > 0 else 1.0)
+            dt = (t_diff - dt_mu) / (dt_sd if dt_sd > 0 else 1.0)
+            tf = torch.stack([
+                torch.full((N,), st, dtype=torch.float32, device=device),
+                torch.full((N,), dt, dtype=torch.float32, device=device)
+            ], dim=-1)
+            return tf.unsqueeze(0).expand(B, N, 2)
+
+        preds_denorm = []
+
+        for k in range(1, len(time_indices)):
+            i_prev = int(time_indices[k-1])
+            i_curr = int(time_indices[k])
+            tfb = time_feats(i_prev, i_curr)
+
+            x_step = torch.cat([x_curr[..., :Cu+Cc], tfb], dim=-1)   # [B, N, Cu(+Cc)+2]
+
+            # Same call pattern as training, but with custom coordinates
+            if getattr(self.model_config, 'use_conditional_norm', False):
+                pred_norm = self.model(
+                    latent_tokens_coord=latent_tokens_coord,
+                    xcoord=coord,  # Use the provided coordinates
+                    pndata=x_step[..., :-1],             # drop last time feature (matches your train/val)
+                    timer=getattr(self, "timer", None),
+                    condition=x_step[..., 0, -2:-1]      # per-sample condition from the time features
+                )
+            else:
+                pred_norm = self.model(
+                    latent_tokens_coord=latent_tokens_coord,
+                    xcoord=coord,  # Use the provided coordinates
+                    pndata=x_step,
+                    timer=getattr(self, "timer", None)
+                )
+            # pred_norm: [B, N, Cu]
+
+            # De-normalize to u_next for metrics and for rolling the state
+            if self.stepper_mode == "output":
+                u_next = pred_norm * u_std + u_mean
+            elif self.stepper_mode == "residual":
+                res_den = pred_norm * (res_s if res_s is not None else 1.0) + (res_m if res_m is not None else 0.0)
+                u_prev  = x_curr[..., :Cu] * u_std + u_mean
+                u_next  = u_prev + res_den
+            elif self.stepper_mode == "time_der":
+                der_den = pred_norm * (der_s if der_s is not None else 1.0) + (der_m if der_m is not None else 0.0)
+                u_prev  = x_curr[..., :Cu] * u_std + u_mean
+                dt_sec  = float(self.t_values[i_curr] - self.t_values[i_prev])  # true Δt
+                u_next  = u_prev + der_den * dt_sec
+            else:
+                raise ValueError(f"Unsupported stepper_mode: {self.stepper_mode}")
+
+            preds_denorm.append(u_next)  # [B, N, Cu]
 
             # Rebuild normalized features to feed the next step
             u_next_norm = (u_next - u_mean) / u_std
@@ -1000,23 +1188,23 @@ class SequentialTrainer(BaseTrainer):
         print(f"\n[EVALUATION] Starting pair-based evaluation for metrics...")
         
         # Debug: Print model and data info
-        print(f"[DEBUG] Model info:")
-        print(f"  Model training mode: {self.model.training}")
-        print(f"  Total parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-        print(f"  Input channels: {self.num_input_channels}")
-        print(f"  Output channels: {self.num_output_channels}")
-        print(f"[DEBUG] Data stats:")
-        print(f"  u_mean: {self.stats['u']['mean'].flatten()[:6].tolist()}")
-        print(f"  u_std: {self.stats['u']['std'].flatten()[:6].tolist()}")
-        if 'c' in self.stats:
-            print(f"  c_mean: {self.stats['c']['mean'].flatten().tolist()}")
-            print(f"  c_std: {self.stats['c']['std'].flatten().tolist()}")
-        if 'start_time' in self.stats:
-            print(f"  start_time mean/std: {self.stats['start_time']['mean'].item():.6e} / {self.stats['start_time']['std'].item():.6e}")
-            print(f"  time_diffs mean/std: {self.stats['time_diffs']['mean'].item():.6e} / {self.stats['time_diffs']['std'].item():.6e}")
-        print(f"[DEBUG] Dataset info:")
-        print(f"  Stepper mode: {self.stepper_mode}")
-        print(f"  Max time diff: {self.max_time_diff}")
+        # print(f"[DEBUG] Model info:")
+        # print(f"  Model training mode: {self.model.training}")
+        # print(f"  Total parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+        # print(f"  Input channels: {self.num_input_channels}")
+        # print(f"  Output channels: {self.num_output_channels}")
+        # print(f"[DEBUG] Data stats:")
+        # print(f"  u_mean: {self.stats['u']['mean'].flatten()[:6].tolist()}")
+        # print(f"  u_std: {self.stats['u']['std'].flatten()[:6].tolist()}")
+        # if 'c' in self.stats:
+        #     print(f"  c_mean: {self.stats['c']['mean'].flatten().tolist()}")
+        #     print(f"  c_std: {self.stats['c']['std'].flatten().tolist()}")
+        # if 'start_time' in self.stats:
+        #     print(f"  start_time mean/std: {self.stats['start_time']['mean'].item():.6e} / {self.stats['start_time']['std'].item():.6e}")
+        #     print(f"  time_diffs mean/std: {self.stats['time_diffs']['mean'].item():.6e} / {self.stats['time_diffs']['std'].item():.6e}")
+        # print(f"[DEBUG] Dataset info:")
+        # print(f"  Stepper mode: {self.stepper_mode}")
+        # print(f"  Max time diff: {self.max_time_diff}")
         print(f"  Time step: {self.time_step}")
         if hasattr(self, 'coord_scaler'):
             print(f"  Coordinate scaler: {type(self.coord_scaler).__name__}")
@@ -1035,17 +1223,17 @@ class SequentialTrainer(BaseTrainer):
                     x_batch, y_batch, coord = self._unpack_batch_fx_any(batch)
                     
                     # CRITICAL DEBUG - First batch only
-                    if batch_idx == 0:
-                        print(f"\n{'='*70}")
-                        print(f"FIRST BATCH DEBUG (batch_idx=0)")
-                        print(f"{'='*70}")
-                        print(f"x_batch shape: {x_batch.shape}")
-                        print(f"y_batch shape: {y_batch.shape}")
-                        print(f"coord shape: {coord.shape}")
-                        print(f"x_batch stats: min={x_batch.min():.6f}, max={x_batch.max():.6f}, mean={x_batch.mean():.6f}")
-                        print(f"y_batch stats: min={y_batch.min():.6f}, max={y_batch.max():.6f}, mean={y_batch.mean():.6f}")
-                        print(f"coord stats: min={coord.min():.6f}, max={coord.max():.6f}")
-                        print(f"{'='*70}\n")
+                    # if batch_idx == 0:
+                    #     print(f"\n{'='*70}")
+                    #     print(f"FIRST BATCH DEBUG (batch_idx=0)")
+                    #     print(f"{'='*70}")
+                    #     print(f"x_batch shape: {x_batch.shape}")
+                    #     print(f"y_batch shape: {y_batch.shape}")
+                    #     print(f"coord shape: {coord.shape}")
+                    #     print(f"x_batch stats: min={x_batch.min():.6f}, max={x_batch.max():.6f}, mean={x_batch.mean():.6f}")
+                    #     print(f"y_batch stats: min={y_batch.min():.6f}, max={y_batch.max():.6f}, mean={y_batch.mean():.6f}")
+                    #     print(f"coord stats: min={coord.min():.6f}, max={coord.max():.6f}")
+                    #     print(f"{'='*70}\n")
                     batch_idx += 1
 
                     # x_batch, y_batch = batch
@@ -1145,56 +1333,150 @@ class SequentialTrainer(BaseTrainer):
                         )
 
                 # Debug first batch - Check for input issues
-                if overall["batches"] == 0:
-                    print(f"\n[DEBUG] First batch analysis:")
-                    print(f"  Shapes: x_batch{tuple(x_batch.shape)}, y_batch{tuple(y_batch.shape)}, coord{tuple(coord.shape)}, pred{tuple(pred.shape)}")
-                    print(f"  Coord (scaled) range: [{coord.min():.6f}, {coord.max():.6f}]")
-                    
-                    # Check if using conditional norm
-                    uses_cond_norm = getattr(self.model_config, 'use_conditional_norm', False)
-                    print(f"  Conditional norm: {uses_cond_norm}")
-                    
-                    # Analyze input channels
-                    print(f"  x_batch statistics:")
-                    print(f"    Overall: min={x_batch.min():.4f}, max={x_batch.max():.4f}, mean={x_batch.mean():.4f}, std={x_batch.std():.4f}")
-                    print(f"    Per channel (sample 0, all nodes averaged):")
-                    for ch in range(x_batch.shape[-1]):
-                        ch_data = x_batch[0, :, ch]
-                        print(f"      Ch{ch}: mean={ch_data.mean():.4f}, std={ch_data.std():.4f}, range=[{ch_data.min():.4f}, {ch_data.max():.4f}]")
-                    
-                    # Check normalized outputs
-                    print(f"  y_batch (normalized target): min={y_batch.min():.4f}, max={y_batch.max():.4f}, mean={y_batch.mean():.4f}")
-                    print(f"  pred (normalized output): min={pred.min():.4f}, max={pred.max():.4f}, mean={pred.mean():.4f}")
-                    print(f"  Prediction error: min={(pred-y_batch).min():.4f}, max={(pred-y_batch).max():.4f}, mean={(pred-y_batch).mean():.4f}, abs_mean={(pred-y_batch).abs().mean():.4f}")
+                # if overall["batches"] == 0:
+                #     print(f"\n[DEBUG] First batch analysis:")
+                #     print(f"  Shapes: x_batch{tuple(x_batch.shape)}, y_batch{tuple(y_batch.shape)}, coord{tuple(coord.shape)}, pred{tuple(pred.shape)}")
+                #     print(f"  Coord (scaled) range: [{coord.min():.6f}, {coord.max():.6f}]")
+                #     
+                #     # Check if using conditional norm
+                #     uses_cond_norm = getattr(self.model_config, 'use_conditional_norm', False)
+                #     print(f"  Conditional norm: {uses_cond_norm}")
+                #     
+                #     # Analyze input channels
+                #     print(f"  x_batch statistics:")
+                #     print(f"    Overall: min={x_batch.min():.4f}, max={x_batch.max():.4f}, mean={x_batch.mean():.4f}, std={x_batch.std():.4f}")
+                #     print(f"    Per channel (sample 0, all nodes averaged):")
+                #     for ch in range(x_batch.shape[-1]):
+                #         ch_data = x_batch[0, :, ch]
+                #         print(f"      Ch{ch}: mean={ch_data.mean():.4f}, std={ch_data.std():.4f}, range=[{ch_data.min():.4f}, {ch_data.max():.4f}]")
+                #     
+                #     # Check normalized outputs
+                #     print(f"  y_batch (normalized target): min={y_batch.min():.4f}, max={y_batch.max():.4f}, mean={y_batch.mean():.4f}")
+                #     print(f"  pred (normalized output): min={pred.min():.4f}, max={pred.max():.4f}, mean={pred.mean():.4f}")
+                #     print(f"  Prediction error: min={(pred-y_batch).min():.4f}, max={(pred-y_batch).max():.4f}, mean={(pred-y_batch).mean():.4f}, abs_mean={(pred-y_batch).abs().mean():.4f}")
                 
-                # Compute MSE loss (same metric as training, in normalized space)
-                mse_loss = torch.nn.functional.mse_loss(pred, y_batch)
+                # Compute MSE loss using same method as validation (for 1D/maglif problems)
+                # Use self.loss_fn (nn.MSELoss()) instead of functional.mse_loss to match validation exactly
+                if self.coord_dim == 1 or getattr(self.dataset_config, "backend", "").lower() == "well_maglif":
+                    # For 1D/maglif: use same loss computation as validation
+                    mse_loss = self.loss_fn(pred, y_batch)
+                else:
+                    # For other problems: keep original functional.mse_loss
+                    mse_loss = torch.nn.functional.mse_loss(pred, y_batch)
+                # if overall["batches"] == 0:
+                #     print(f"\n[DEBUG TEST] Test loss computation (batch 0):")
+                #     print(f"  pred shape: {pred.shape}, y_batch shape: {y_batch.shape}")
+                #     print(f"  pred stats (normalized): min={pred.min().item():.6f}, max={pred.max().item():.6f}, mean={pred.mean().item():.6f}, std={pred.std().item():.6f}")
+                #     print(f"  y_batch stats (normalized): min={y_batch.min().item():.6f}, max={y_batch.max().item():.6f}, mean={y_batch.mean().item():.6f}, std={y_batch.std().item():.6f}")
+                #     print(f"  mse_loss value: {mse_loss.item():.6f}")
+                #     print(f"  Using loss function: {'self.loss_fn (same as validation)' if (self.coord_dim == 1 or getattr(self.dataset_config, 'backend', '').lower() == 'well_maglif') else 'torch.nn.functional.mse_loss'}")
+                #     print(f"  self.loss_fn type: {type(self.loss_fn)}")
+                #     print(f"  Using stats from self.stats: mean shape={self.stats['u']['mean'].shape}, first 3={self.stats['u']['mean'].flatten()[:3].tolist()}")
+                #     print(f"  metadata.global_mean (should match): first 3={self.metadata.global_mean[:3]}")
+                #     print(f"  metadata.global_std (should match): first 3={self.metadata.global_std[:3]}")
+                #     # Compute MSE manually to verify
+                #     mse_manual = ((pred - y_batch) ** 2).mean().item()
+                #     print(f"  MSE manual computation: {mse_manual:.6f} (should match mse_loss)")
+                #     # Check if data is actually normalized (should have mean ~0, std ~1)
+                #     print(f"  y_batch normalized check: mean={y_batch.mean().item():.6f}, std={y_batch.std().item():.6f} (should be ~0 and ~1)")
+                #     print(f"  pred normalized check: mean={pred.mean().item():.6f}, std={pred.std().item():.6f}")
+                # Store per-batch MSE loss (this is already averaged over batch elements by nn.MSELoss)
                 all_mse_losses.append(mse_loss.item())
                 
-                # Compute relative L1 and L2 losses on NORMALIZED data (like compute_batch_errors does)
-                # This ensures consistency with the standard metric computation
-                abs_error_norm = torch.abs(pred - y_batch)
-                abs_truth_norm = torch.abs(y_batch)
+                # Debug: Check if batch size affects averaging
+                # if overall["batches"] == 0:
+                #     batch_size = pred.shape[0]
+                #     num_elements = pred.numel()
+                #     print(f"  Batch size: {batch_size}, Total elements: {num_elements}")
+                #     print(f"  MSE per element: {mse_loss.item():.6f} (already averaged by nn.MSELoss)")
+                #     print(f"  Sum of squared errors: {((pred - y_batch) ** 2).sum().item():.6f}")
+                #     print(f"  Sum / num_elements: {((pred - y_batch) ** 2).sum().item() / num_elements:.6f} (should match mse_loss)")
                 
-                rel_l1 = (abs_error_norm.sum() / (abs_truth_norm.sum() + 1e-10)).item()
-                rel_l2 = (torch.sqrt((abs_error_norm**2).sum()) / (torch.sqrt((abs_truth_norm**2).sum()) + 1e-10)).item()
+                # Debug: Print stats comparison (first batch only)
+                # if overall["batches"] == 0:
+                #     print(f"\n[DEBUG METRICS] Stats comparison:")
+                #     print(f"  self.stats['u']['mean'] shape: {self.stats['u']['mean'].shape}, first 3: {self.stats['u']['mean'].flatten()[:3].tolist()}")
+                #     print(f"  self.stats['u']['std'] shape: {self.stats['u']['std'].shape}, first 3: {self.stats['u']['std'].flatten()[:3].tolist()}")
+                #     print(f"  metadata.global_mean length: {len(self.metadata.global_mean)}, first 3: {self.metadata.global_mean[:3]}")
+                #     print(f"  metadata.global_std length: {len(self.metadata.global_std)}, first 3: {self.metadata.global_std[:3]}")
+                #     # Check if they match
+                #     stats_mean_tensor = self.stats['u']['mean'].flatten().cpu()
+                #     stats_std_tensor = self.stats['u']['std'].flatten().cpu()
+                #     metadata_mean_tensor = torch.tensor(self.metadata.global_mean, dtype=self.dtype)
+                #     metadata_std_tensor = torch.tensor(self.metadata.global_std, dtype=self.dtype)
+                #     mean_match = torch.allclose(stats_mean_tensor, metadata_mean_tensor, atol=1e-5)
+                #     std_match = torch.allclose(stats_std_tensor, metadata_std_tensor, atol=1e-5)
+                #     print(f"  Are they equal? mean: {mean_match}, std: {std_match}")
+                #     if not mean_match:
+                #         diff = (stats_mean_tensor - metadata_mean_tensor).abs().max().item()
+                #         print(f"    Mean max diff: {diff:.6e}")
+                #         print(f"    WARNING: metadata.global_mean does NOT match self.stats['u']['mean']!")
+                #         print(f"    This could cause incorrect GAOT relative error computation!")
+                #     if not std_match:
+                #         diff = (stats_std_tensor - metadata_std_tensor).abs().max().item()
+                #         print(f"    Std max diff: {diff:.6e}")
+                #         print(f"    WARNING: metadata.global_std does NOT match self.stats['u']['std']!")
+                #         print(f"    This could cause incorrect GAOT relative error computation!")
+                #     print(f"  Normalized pred stats: mean={pred.mean().item():.6f}, std={pred.std().item():.6f}")
+                #     print(f"  Normalized y_batch stats: mean={y_batch.mean().item():.6f}, std={y_batch.std().item():.6f}")
+                #     print(f"  MSE loss (on normalized): {mse_loss.item():.6f}")
+                #     print(f"  self.loss_fn reduction: {getattr(self.loss_fn, 'reduction', 'N/A')}")
                 
-                if overall["batches"] == 0:
-                    print(f"  First batch rel_l1: {rel_l1:.6f}, rel_l2: {rel_l2:.6f}, mse: {mse_loss.item():.6f}\n")
+                # For 1D/maglif: compute rel L1 and L2 on normalized data directly (same as training/validation)
+                # Training/validation compute loss on normalized data directly, so we should do the same
+                if self.coord_dim == 1 or getattr(self.dataset_config, "backend", "").lower() == "well_maglif":
+                    # Use normalized data directly (same as training/validation)
+                    abs_error_norm = torch.abs(pred - y_batch)
+                    abs_truth_norm = torch.abs(y_batch)
+                    rel_l1 = (abs_error_norm.sum() / (abs_truth_norm.sum() + 1e-10)).item()
+                    rel_l2 = (torch.sqrt((abs_error_norm**2).sum()) / (torch.sqrt((abs_truth_norm**2).sum()) + 1e-10)).item()
+                    
+                    # if overall["batches"] == 0:
+                    #     print(f"  [DEBUG METRICS] Rel L1/L2 computed on normalized data (like training):")
+                    #     print(f"    Rel L1: {rel_l1:.6f}, Rel L2: {rel_l2:.6f}")
+                else:
+                    # For other problems: compute on normalized data (original method)
+                    abs_error_norm = torch.abs(pred - y_batch)
+                    abs_truth_norm = torch.abs(y_batch)
+                    rel_l1 = (abs_error_norm.sum() / (abs_truth_norm.sum() + 1e-10)).item()
+                    rel_l2 = (torch.sqrt((abs_error_norm**2).sum()) / (torch.sqrt((abs_truth_norm**2).sum()) + 1e-10)).item()
                 
-                all_l1_losses.append(rel_l1)
-                all_l2_losses.append(rel_l2)
-                
-                # Denormalize for compute_batch_errors (expects denormalized data)
+                # For GAOT relative error: denormalize first (compute_batch_errors expects denormalized)
+                # Then compute_batch_errors will re-normalize using metadata.global_mean/std
+                # But we need to ensure metadata stats match self.stats (they should after init_dataset)
                 u_mean = self.stats["u"]["mean"].to(self.device)  # [1, Cu]
                 u_std  = self.stats["u"]["std"].to(self.device)   # [1, Cu]
                 y_den  = y_batch * u_std + u_mean
                 p_den  = pred    * u_std + u_mean
+                
+                # if overall["batches"] == 0:
+                #     print(f"  [DEBUG METRICS] For GAOT relative error:")
+                #     print(f"    Denormalized y_den stats: mean={y_den.mean().item():.6f}, std={y_den.std().item():.6f}")
+                #     print(f"    Denormalized p_den stats: mean={p_den.mean().item():.6f}, std={p_den.std().item():.6f}")
+                #     print(f"    compute_batch_errors will re-normalize using metadata.global_mean/std")
+                
+                # if overall["batches"] == 0:
+                #     print(f"  First batch rel_l1: {rel_l1:.6f}, rel_l2: {rel_l2:.6f}, mse: {mse_loss.item():.6f}\n")
+                
+                all_l1_losses.append(rel_l1)
+                all_l2_losses.append(rel_l2)
 
-                # compute metric per pair (wrap to [B,1,N,C] so it matches your metric utils)
-                rel = compute_batch_errors(y_den[:, None, :, :],
-                                        p_den[:, None, :, :],
-                                        self.metadata)
+                # compute GAOT relative error metric per pair (wrap to [B,1,N,C] so it matches your metric utils)
+                # For 1D/maglif: use real_stats (self.stats) instead of metadata to match training
+                if self.coord_dim == 1 or getattr(self.dataset_config, "backend", "").lower() == "well_maglif":
+                    # Use self.stats directly to match training normalization
+                    real_mean = self.stats["u"]["mean"].to(self.device).flatten()  # [Cu]
+                    real_std = self.stats["u"]["std"].to(self.device).flatten()   # [Cu]
+                    rel = compute_batch_errors(y_den[:, None, :, :],
+                                            p_den[:, None, :, :],
+                                            self.metadata,
+                                            real_stats_mean=real_mean,
+                                            real_stats_std=real_std)
+                else:
+                    # For other problems: use metadata (original behavior)
+                    rel = compute_batch_errors(y_den[:, None, :, :],
+                                            p_den[:, None, :, :],
+                                            self.metadata)
                 all_relative_errors.append(rel)
 
             # Close progress bar after loop completes
@@ -1214,7 +1496,14 @@ class SequentialTrainer(BaseTrainer):
         final_metric = compute_final_metric(all_relative_errors)
         
         # Compute average losses
+        # Note: During training, loss is computed as total_loss / len(trainer.train_loader)
+        # which averages per-batch losses. We do the same here for consistency.
         avg_mse_loss = np.mean(all_mse_losses) if all_mse_losses else 0.0
+        # if len(all_mse_losses) > 0:
+        #     print(f"[DEBUG METRICS FINAL] Computed average MSE from {len(all_mse_losses)} batches")
+        #     print(f"  Individual batch MSE values (first 5): {all_mse_losses[:5]}")
+        #     print(f"  Average MSE: {avg_mse_loss:.6f}")
+        #     print(f"  Min batch MSE: {min(all_mse_losses):.6f}, Max batch MSE: {max(all_mse_losses):.6f}")
         avg_l1_loss = np.mean(all_l1_losses) if all_l1_losses else 0.0
         avg_l2_loss = np.mean(all_l2_losses) if all_l2_losses else 0.0
         
@@ -1223,6 +1512,7 @@ class SequentialTrainer(BaseTrainer):
         print(f"  MSE loss:    {avg_mse_loss:.6f}")
         print(f"  Rel L1 loss: {avg_l1_loss:.6f}")
         print(f"  Rel L2 loss: {avg_l2_loss:.6f}")
+        print(f"  GAOT relative error: {final_metric:.6f}")
         
         # Print timing statistics (normalized by batch size where relevant)
         if first_batch_time is not None and overall["n_traj"] > 0:
@@ -1328,7 +1618,8 @@ class SequentialTrainer(BaseTrainer):
 
             if not hasattr(self.test_loader.dataset, "u_data"):
                 # Use pair-based evaluation instead of AR-in-memory (streaming)
-                _, example_pairs = self._test_streaming_pairs(mode)
+                metric_value, example_pairs = self._test_streaming_pairs(mode)
+                errors_dict[mode] = metric_value
                 if example_pairs is not None:
                     self._plot_test_results(example_pairs)
                     if self.coord_mode == 'fx':
@@ -1494,6 +1785,26 @@ class SequentialTrainer(BaseTrainer):
             if self.coord_mode == 'fx':
                 self._create_animation(example_data)
         
+        # For multires backend, also compute per-resolution metrics and animations
+        backend = getattr(self.dataset_config, "backend", "netcdf").lower()
+        if backend == "well_multires":
+            print("\n" + "="*60)
+            print("Computing per-resolution metrics and generating animations...")
+            print("="*60)
+            try:
+                # Evaluate test split (default)
+                self._test_per_resolution_multires("test")
+                # Also evaluate train and valid splits if available
+                if hasattr(self, 'train_loader') and self.train_loader is not None:
+                    self._test_per_resolution_multires("train")
+                if hasattr(self, 'val_loader') and self.val_loader is not None:
+                    self._test_per_resolution_multires("valid")
+            except Exception as e:
+                print(f"\n[WARNING] Per-resolution evaluation failed: {e}")
+                import traceback
+                traceback.print_exc()
+                print("Continuing without per-resolution metrics...")
+        
         print("Sequential model testing complete.")
     
     def _prepare_example_data(self, x_batch, y_batch, pred, time_indices, coord_batch=None):
@@ -1639,7 +1950,8 @@ class SequentialTrainer(BaseTrainer):
                     show_error=True,
                     u_mean=example_data.get('u_mean'),  # Pass normalization stats
                     u_std=example_data.get('u_std'),     # for correct error computation
-                    max_frames=max_frames
+                    max_frames=max_frames,
+                    metadata=self.metadata  # Pass metadata for GAOT relative error computation
                 )
             else:
                 # Use 2D scatter animation
@@ -1684,3 +1996,373 @@ class SequentialTrainer(BaseTrainer):
             traceback.print_exc()
             # Clean up
             gc.collect()
+    
+    def _test_per_resolution_multires(self, split="test"):
+        """
+        Evaluate model per resolution for multires datasets.
+        Groups batches by resolution (coord.shape[0]) and computes metrics separately.
+        Also generates one animation per resolution and saves results to CSV.
+        
+        Args:
+            split: "train", "valid", or "test" - which split to evaluate
+        """
+        from collections import defaultdict
+        import pandas as pd
+        
+        print(f"\n[PER-RESOLUTION] Starting per-resolution evaluation for {split} split...")
+        
+        # Get the appropriate loader
+        if split == "train":
+            loader = getattr(self, 'train_loader', None)
+        elif split == "valid":
+            loader = getattr(self, 'val_loader', None)
+        elif split == "test":
+            loader = getattr(self, 'test_loader', None)
+        else:
+            print(f"WARNING: Unknown split '{split}'. Skipping per-resolution evaluation.")
+            return
+        
+        # Check if loader is available
+        if loader is None:
+            print(f"WARNING: {split} loader is None. Skipping per-resolution evaluation for {split} split.")
+            return
+        
+        # Group batches by resolution (using grid dimensions H,W as key, not just N)
+        resolution_stats = defaultdict(lambda: {
+            'count': 0,
+            'sum_mse_norm': 0.0,
+            'sum_rel1': 0.0,
+            'sum_rel2': 0.0,
+            'chunk_errors': [],
+            'coord': None,
+            'sample_input': None,
+            'sample_target': None,
+            'sample_pred': None,
+            'N_points': 0,  # Store actual N for reference
+            'res_key': None  # Store (H, W) tuple
+        })
+        
+        self.model.eval()
+        
+        with torch.no_grad():
+            pbar = tqdm(desc=f"Collecting per-resolution data ({split})", unit="batch", colour="cyan")
+            try:
+                for batch in loader:
+                    # Multires batches come as dicts: {"x": ..., "y": ..., "coord": ...}
+                    if not isinstance(batch, dict):
+                        print("\nWARNING: Expected dict batch format for multires. Skipping per-resolution eval.")
+                        return
+                    
+                    x_batch = batch["x"].to(self.device)
+                    y_batch = batch["y"].to(self.device)
+                    coord = batch["coord"].to(self.device)
+                    
+                    # Use coordinate grid dimensions to uniquely identify resolution
+                    # This handles cases where different resolutions have the same N (e.g., 64x64 and 128x32 both have 4096 points)
+                    coord_np = coord.detach().cpu().numpy()
+                    xs = np.round(coord_np[:, 0], 6)
+                    ys = np.round(coord_np[:, 1], 6)
+                    ux = np.unique(xs)
+                    uy = np.unique(ys)
+                    H, W = len(ux), len(uy)
+                    
+                    # Use tuple (H, W) as unique resolution identifier
+                    res_key = (H, W)
+                    N = coord.shape[0]  # Number of points (kept for backward compatibility)
+                    B = x_batch.shape[0]
+                    
+                    # Model prediction
+                    latent_tokens_coord = self.latent_tokens_coord.to(self.device)
+                    if getattr(self.model_config, 'use_conditional_norm', False):
+                        x_input = x_batch[..., :-1]
+                        condition = x_batch[..., 0, -2:-1] if x_batch.shape[-1] > 1 else None
+                    else:
+                        x_input = x_batch
+                        condition = None
+                    
+                    if condition is not None:
+                        pred = self.model(
+                            latent_tokens_coord=latent_tokens_coord,
+                            xcoord=coord,
+                            pndata=x_input,
+                            timer=getattr(self, "timer", None),
+                            condition=condition
+                        )
+                    else:
+                        pred = self.model(
+                            latent_tokens_coord=latent_tokens_coord,
+                            xcoord=coord,
+                            pndata=x_input,
+                            timer=getattr(self, "timer", None)
+                        )
+                    
+                    # Accumulate metrics using res_key (H, W) instead of N
+                    resolution_stats[res_key]['count'] += B
+                    resolution_stats[res_key]['N_points'] = N  # Store N for reference
+                    resolution_stats[res_key]['res_key'] = res_key
+                    
+                    # MSE on normalized data
+                    mse_norm_per_sample = torch.mean((pred - y_batch) ** 2, dim=(-2, -1))
+                    resolution_stats[res_key]['sum_mse_norm'] += mse_norm_per_sample.sum().item()
+                    
+                    # Denormalize for relative errors
+                    u_mean = self.stats["u"]["mean"].to(self.device)
+                    u_std = self.stats["u"]["std"].to(self.device)
+                    pred_denorm = pred * u_std + u_mean
+                    target_denorm = y_batch * u_std + u_mean
+                    diff_denorm = pred_denorm - target_denorm
+                    
+                    # Relative L1
+                    abs_diff = diff_denorm.abs().sum(dim=(-2, -1))
+                    abs_target = target_denorm.abs().sum(dim=(-2, -1)).clamp_min(1e-12)
+                    rel_l1_per_sample = abs_diff / abs_target
+                    resolution_stats[res_key]['sum_rel1'] += rel_l1_per_sample.sum().item()
+                    
+                    # Relative L2
+                    l2_diff = torch.sqrt((diff_denorm ** 2).sum(dim=(-2, -1)))
+                    l2_target = torch.sqrt((target_denorm ** 2).sum(dim=(-2, -1))).clamp_min(1e-12)
+                    rel_l2_per_sample = l2_diff / l2_target
+                    resolution_stats[res_key]['sum_rel2'] += rel_l2_per_sample.sum().item()
+                    
+                    # GAOT relative L1 metric
+                    rel_errors = compute_batch_errors(
+                        target_denorm[:, None, :, :],
+                        pred_denorm[:, None, :, :],
+                        self.metadata
+                    ).cpu()
+                    resolution_stats[res_key]['chunk_errors'].append(rel_errors)
+                    
+                    # Store sample data for animation (first sample only)
+                    if resolution_stats[res_key]['sample_input'] is None:
+                        resolution_stats[res_key]['sample_input'] = x_batch[0:1].cpu()
+                        resolution_stats[res_key]['sample_target'] = y_batch[0:1].cpu()
+                        resolution_stats[res_key]['sample_pred'] = pred[0:1].detach().cpu()
+                    if resolution_stats[res_key]['coord'] is None:
+                        resolution_stats[res_key]['coord'] = coord.cpu()
+                    
+                    pbar.update(1)
+            except (StopIteration, FileNotFoundError, RuntimeError) as e:
+                print(f"\nWARNING: Error iterating test loader: {e}")
+                print("This may happen if test data is not available for all resolutions.")
+                print("Resolutions without test files will be automatically skipped.")
+                print("Continuing with per-resolution evaluation for available resolutions...")
+                # Don't return - continue with what we have collected so far
+            except Exception as e:
+                print(f"\nWARNING: Unexpected error during per-resolution evaluation: {e}")
+                import traceback
+                traceback.print_exc()
+                pbar.close()
+                return
+            
+            pbar.close()
+        
+        if not resolution_stats:
+            print("WARNING: No data collected for per-resolution evaluation.")
+            print("This may happen if test data is not available for any resolution.")
+            print("Resolutions without test files (e.g., 128x32, 256x256) are automatically skipped.")
+            return
+        
+        # Print per-resolution results and prepare CSV data
+        print("\n" + "="*60)
+        print("PER-RESOLUTION METRICS:")
+        print("="*60)
+        print("Note: Resolutions without test data (e.g., 128x32, 256x256) are automatically skipped.")
+        
+        def get_resolution_label(res_key, coord, N_points):
+            """Get human-readable resolution label from (H, W) tuple"""
+            if isinstance(res_key, tuple) and len(res_key) == 2:
+                H, W = res_key
+                return f"{H}x{W}"
+            # Fallback: try to infer from coordinates
+            if coord is not None:
+                xy = coord.detach().cpu().numpy()
+                xs = np.round(xy[:, 0], 6)
+                ys = np.round(xy[:, 1], 6)
+                ux = np.unique(xs)
+                uy = np.unique(ys)
+                H, W = len(ux), len(uy)
+                if H * W == coord.shape[0]:
+                    return f"{H}x{W}"
+            return f"N={N_points}"
+        
+        csv_rows = []
+        # Sort by resolution key (H, W) for consistent ordering
+        for res_key in sorted(resolution_stats.keys(), key=lambda x: (x[0], x[1]) if isinstance(x, tuple) else (0, x)):
+            data = resolution_stats[res_key]
+            num_samples = data['count']
+            if num_samples == 0:
+                continue
+            
+            N_points = data.get('N_points', res_key if isinstance(res_key, int) else 0)
+            
+            mse_norm = data['sum_mse_norm'] / num_samples
+            rel_l1 = data['sum_rel1'] / num_samples
+            rel_l2 = data['sum_rel2'] / num_samples
+            
+            if data['chunk_errors']:
+                chunk_errors = torch.cat(data['chunk_errors'], dim=0)
+                gaot_rel = compute_final_metric(chunk_errors)
+            else:
+                gaot_rel = float('nan')
+            
+            coord = data['coord']
+            res_label = get_resolution_label(res_key, coord, N_points)
+            
+            print(f"\nResolution: {res_label} (N={N_points})")
+            print(f"  Samples: {num_samples}")
+            print(f"  MSE (normalized): {mse_norm:.6e}")
+            print(f"  Relative L1: {rel_l1:.6f}")
+            print(f"  Relative L2: {rel_l2:.6f}")
+            print(f"  GAOT relative L1: {gaot_rel:.6f}")
+            
+            csv_rows.append({
+                'dataset': split,
+                'resolution': res_label,
+                'N_points': N_points,
+                'num_samples': num_samples,
+                'mse_normalized': mse_norm,
+                'rel_l1': rel_l1,
+                'rel_l2': rel_l2,
+                'gaot_rel_l1': gaot_rel
+            })
+        
+        # Save CSV results
+        import os
+        result_dir = os.path.dirname(self.path_config.result_path)
+        csv_path = os.path.join(result_dir, f"per_resolution_metrics_{split}.csv")
+        if csv_rows:
+            df = pd.DataFrame(csv_rows)
+            df.to_csv(csv_path, index=False)
+            print(f"\nSaved per-resolution metrics to: {csv_path}")
+        
+        # Generate animations per resolution only for test split (to avoid too many files)
+        if split != "test":
+            print(f"\nSkipping animation generation for {split} split (only generating for test split).")
+            return
+        
+        # Generate animations per resolution
+        print("\n" + "="*60)
+        print("Generating animations per resolution...")
+        print("="*60)
+        
+        # Create animation directory
+        animation_dir = os.path.join(result_dir, "per_resolution_animations")
+        os.makedirs(animation_dir, exist_ok=True)
+        
+        # Build time indices for autoregressive prediction
+        max_rollout_steps = 50
+        time_step = int(getattr(self.dataset_config, 'time_step', 1))
+        time_indices = np.arange(0, min(max_rollout_steps, 101), time_step, dtype=int)
+        time_indices_anim = time_indices[::10]  # Every 10th frame for animation
+        
+        # Sort by resolution key for consistent ordering
+        for res_key in sorted(resolution_stats.keys(), key=lambda x: (x[0], x[1]) if isinstance(x, tuple) else (0, x)):
+            data = resolution_stats[res_key]
+            if data['sample_input'] is None:
+                continue
+            
+            coord = data['coord'].to(self.device)
+            N_points = data.get('N_points', res_key if isinstance(res_key, int) else 0)
+            res_label = get_resolution_label(res_key, coord, N_points)
+            
+            print(f"\nCreating animation for resolution: {res_label}")
+            
+            try:
+                first_input_full = data['sample_input'].to(self.device)  # [1, N, C_full]
+                u_channels = self.stats["u"]["mean"].shape[-1]
+                c_channels = self.stats["c"]["mean"].shape[-1] if "c" in self.stats else 0
+                
+                # Extract u and c from input (input has u + c + time features)
+                first_input_u_c = first_input_full[..., :u_channels + c_channels]  # [1, N, Cu+Cc]
+                
+                # Use trainer-side autoregressive prediction for better compatibility
+                if getattr(self.data_processor, "runtime_hints", {}).get("use_trainer_autoreg", False):
+                    # Build time features for initial state
+                    st_mu = float(self.stats["start_time"]["mean"])
+                    st_sd = float(self.stats["start_time"]["std"])
+                    dt_mu = float(self.stats["time_diffs"]["mean"])
+                    dt_sd = float(self.stats["time_diffs"]["std"])
+                    
+                    # Create initial x_batch with time features
+                    N_nodes = coord.shape[0]
+                    t0_idx = 0
+                    t1_idx = time_indices[1] if len(time_indices) > 1 else time_indices[0] + time_step
+                    t_start = float(self.t_values[t0_idx])
+                    t_diff = float(self.t_values[t1_idx] - self.t_values[t0_idx])
+                    start_norm = (t_start - st_mu) / (st_sd if st_sd > 0 else 1.0)
+                    diff_norm = (t_diff - dt_mu) / (dt_sd if dt_sd > 0 else 1.0)
+                    
+                    st_feat = torch.full((1, N_nodes, 1), start_norm, dtype=torch.float32, device=self.device)
+                    dt_feat = torch.full((1, N_nodes, 1), diff_norm, dtype=torch.float32, device=self.device)
+                    x0_with_time = torch.cat([first_input_u_c, st_feat, dt_feat], dim=-1)  # [1, N, Cu+Cc+2]
+                    
+                    # Use resolution-specific coordinates for autoregressive prediction
+                    pred_sequence = self._autoregressive_predict_trainer_side_with_coord(x0_with_time, time_indices, coord)
+                    # pred_sequence: [1, K, N, Cu] where K = len(time_indices) - 1
+                    pred_denorm = pred_sequence[0].detach().cpu()  # [K, N, Cu] - detach to avoid gradient issues
+                else:
+                    # Fallback to model's autoregressive_predict
+                    with torch.no_grad():
+                        pred_sequence = self.model.autoregressive_predict(
+                            x_batch=first_input_u_c,
+                            time_indices=time_indices,
+                            t_values=self.t_values if hasattr(self, 't_values') else np.arange(len(time_indices)),
+                            stats=self.stats,
+                            stepper_mode=getattr(self.dataset_config, 'stepper_mode', 'output'),
+                            latent_tokens_coord=self.latent_tokens_coord.to(self.device),
+                            fixed_coord=coord,
+                            encoder_nbrs=None,
+                            decoder_nbrs=None,
+                            use_conditional_norm=getattr(self.model_config, 'use_conditional_norm', False)
+                        )  # [1, T-1, N, C]
+                        
+                        u_mean = self.stats["u"]["mean"].cpu()
+                        u_std = self.stats["u"]["std"].cpu()
+                        pred_denorm = pred_sequence[0].cpu() * u_std + u_mean  # [T-1, N, C]
+                
+                # For animation, we need GT sequence too (use predictions as placeholder for now)
+                gt_denorm = pred_denorm.clone().detach()
+                
+                u_mean = self.stats["u"]["mean"].cpu()
+                u_std = self.stats["u"]["std"].cpu()
+                input_denorm = (first_input_u_c[0, :, :u_channels].detach().cpu() * u_std + u_mean).numpy()
+                coord_phys = self.data_processor.coord_scaler.inverse_transform(coord.detach().cpu()).numpy()
+                
+                gt_anim = gt_denorm[::10].numpy()
+                pred_anim = pred_denorm[::10].numpy()
+                
+                if hasattr(self, 't_values'):
+                    t_vals = self.t_values
+                    time_values = [float(t_vals[idx]) for idx in time_indices_anim[1:]]  # Skip first (input)
+                else:
+                    time_values = [float(idx) for idx in time_indices_anim[1:]]
+                
+                animation_path = os.path.join(animation_dir, f"animation_{res_label}.gif")
+                
+                create_sequential_animation(
+                    gt_sequence=gt_anim,
+                    pred_sequence=pred_anim,
+                    coords=coord_phys,
+                    save_path=animation_path,
+                    input_data=input_denorm,
+                    time_values=time_values,
+                    interval=100,
+                    symmetric=self.metadata.signed['u'] if hasattr(self.metadata, 'signed') and self.metadata.signed.get('u') else [True],
+                    domain=self.metadata.domain_x if hasattr(self.metadata, 'domain_x') else None,
+                    names=self.metadata.names.get('u', None) if hasattr(self.metadata, 'names') else None,
+                    colorbar_type="light",
+                    show_error=True,
+                    dynamic_colorscale=True,
+                    u_mean=u_mean.numpy(),
+                    u_std=u_std.numpy()
+                )
+                
+                print(f"  Saved animation to: {animation_path}")
+                print(f"  Animation frames: {gt_anim.shape[0]}")
+                    
+            except Exception as e:
+                print(f"  WARNING: Could not create animation for {res_label}: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        print(f"\n[PER-RESOLUTION] Evaluation complete for {split} split. Animations saved to: {animation_dir}")

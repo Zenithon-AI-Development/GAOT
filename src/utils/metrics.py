@@ -8,7 +8,7 @@ from src.datasets.dataset import Metadata
 
 EPSILON = 1e-10
 
-def compute_batch_errors(gtr: torch.Tensor, prd: torch.Tensor, metadata: Metadata) -> torch.Tensor:
+def compute_batch_errors(gtr: torch.Tensor, prd: torch.Tensor, metadata: Metadata, real_stats_mean: torch.Tensor = None, real_stats_std: torch.Tensor = None) -> torch.Tensor:
     """
     Compute the per-sample relative L1 errors per variable chunk for a batch.
     
@@ -16,6 +16,8 @@ def compute_batch_errors(gtr: torch.Tensor, prd: torch.Tensor, metadata: Metadat
         gtr (torch.Tensor): Ground truth tensor with shape [batch_size, time, space, var]
         prd (torch.Tensor): Predicted tensor with shape [batch_size, time, space, var]
         metadata (Metadata): Dataset metadata including global_mean, global_std, and variable chunks
+        real_stats_mean (torch.Tensor, optional): Real stats mean [Cu] to use instead of metadata.global_mean
+        real_stats_std (torch.Tensor, optional): Real stats std [Cu] to use instead of metadata.global_std
     
     Returns:
         torch.Tensor: Relative errors per sample per variable chunk, shape [batch_size, num_chunks]
@@ -23,8 +25,15 @@ def compute_batch_errors(gtr: torch.Tensor, prd: torch.Tensor, metadata: Metadat
     # normalize the data
     active_vars = metadata.active_variables
 
-    mean = torch.tensor(metadata.global_mean, device=gtr.device, dtype=gtr.dtype)[active_vars].reshape(1, 1, 1, -1)
-    std = torch.tensor(metadata.global_std, device=gtr.device, dtype=gtr.dtype)[active_vars].reshape(1, 1, 1, -1)
+    # Use real_stats if provided (for 1D/maglif to match training stats), otherwise use metadata
+    if real_stats_mean is not None and real_stats_std is not None:
+        # Use provided real stats (should match self.stats from training)
+        mean = real_stats_mean[active_vars].reshape(1, 1, 1, -1)
+        std = real_stats_std[active_vars].reshape(1, 1, 1, -1)
+    else:
+        # Use metadata stats (original behavior)
+        mean = torch.tensor(metadata.global_mean, device=gtr.device, dtype=gtr.dtype)[active_vars].reshape(1, 1, 1, -1)
+        std = torch.tensor(metadata.global_std, device=gtr.device, dtype=gtr.dtype)[active_vars].reshape(1, 1, 1, -1)
     
     original_chunks = metadata.chunked_variables
     chunked_vars = [original_chunks[i] for i in active_vars]

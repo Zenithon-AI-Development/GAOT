@@ -153,8 +153,8 @@ class AdamOptimizer:
             data_t0 = time.time()
             for ib, batch in enumerate(trainer.train_loader):
                 data_dt = time.time() - data_t0
-                if data_dt > 10:  # adjust threshold
-                    print(f"[DEBUG] slow data fetch: {data_dt:.2f}s (batch {ib})")
+                # if data_dt > 10:  # adjust threshold
+                #     print(f"[DEBUG] slow data fetch: {data_dt:.2f}s (batch {ib})")
 
                 t0 = time.time()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -179,6 +179,10 @@ class AdamOptimizer:
                 step_dt = time.time() - step_t0
 
                 total_loss += train_loss.detach()
+                
+                # Debug: Print first few batch losses to understand the scale
+                # if epoch == 0 and ib < 3:
+                #     print(f"[DEBUG TRAIN BATCH] Epoch {epoch}, batch {ib}: loss={train_loss.detach().cpu().item():.6f}, accumulated_total={total_loss.cpu().item():.6f}")
 
                 # log every batch while debugging
                 _wb_log(trainer, {
@@ -189,14 +193,20 @@ class AdamOptimizer:
                 })
 
                 data_t0 = time.time()  # start timing the *next* data fetch
-                if ib == 0:
-                    print(f"[DEBUG] first batch timings: data={data_dt:.2f}s fwd={fwd_dt:.2f}s bwd={bwd_dt:.2f}s step={step_dt:.2f}s")
+                # if ib == 0:
+                #     print(f"[DEBUG] first batch timings: data={data_dt:.2f}s fwd={fwd_dt:.2f}s bwd={bwd_dt:.2f}s step={step_dt:.2f}s")
 
             if self.scheduler is not None:
                 self.scheduler.step()
 
             # epoch-end eval
-            train_loss = total_loss.cpu().item() / len(trainer.train_loader)
+            num_batches_actual = ib + 1  # Actual number of batches processed
+            num_batches_from_len = len(trainer.train_loader) if hasattr(trainer.train_loader, '__len__') else num_batches_actual
+            # if epoch == 0:
+            #     print(f"[DEBUG OPTIMIZER] Epoch {epoch} end: batches_processed={num_batches_actual}, len(loader)={num_batches_from_len}, total_loss={total_loss.cpu().item():.6f}")
+            train_loss = total_loss.cpu().item() / num_batches_from_len
+            # if epoch == 0:
+            #     print(f"[DEBUG OPTIMIZER] Epoch {epoch} end: computed train_loss={train_loss:.6f} (total_loss/{num_batches_from_len})")
             val_loss = None
             if (epoch + 1) % self.eval_every_eps == 0:
                 val_loss = trainer.validate(trainer.val_loader)

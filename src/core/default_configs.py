@@ -69,6 +69,7 @@ class DatasetConfig:
     batch_size: int = 64                                        # Batch size
     num_workers: int = 4                                        # Number of data loading workers
     shuffle: bool = True                                        # Whether to shuffle training data
+    eval_split: str = "test"                                    # Evaluation split for streaming datasets
     use_metadata_stats: bool = False                            # Use metadata statistics for normalization
     sample_rate: float = 0.1                                    # Sample rate for point clouds
     use_sparse: bool = False                                    # Use sparse representations (PDEGym datasets)
