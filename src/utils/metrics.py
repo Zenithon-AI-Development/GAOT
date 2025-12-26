@@ -83,3 +83,41 @@ def compute_final_metric(all_relative_errors: torch.Tensor) -> float:
     final_metric = torch.mean(median_error_per_chunk)
     
     return final_metric.item()
+
+def compute_rel_l1_l2_normalized(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-10) -> Dict[str, float]:
+    """
+    Compute relative L1 and L2 errors on normalized data.
+    
+    Args:
+        pred (torch.Tensor): Predicted tensor (normalized), shape [batch_size, time, space, var] or [batch_size, space, var]
+        target (torch.Tensor): Target tensor (normalized), shape [batch_size, time, space, var] or [batch_size, space, var]
+        eps (float): Small epsilon to avoid division by zero
+        
+    Returns:
+        Dict[str, float]: Dictionary with 'rel_l1' and 'rel_l2' keys
+    """
+    # Compute absolute difference
+    abs_diff = torch.abs(pred - target)  # Shape: [batch_size, time?, space, var]
+    
+    # Sum over spatial and variable dimensions (and time if present)
+    # Handle both 3D [B, N, C] and 4D [B, T, N, C] tensors
+    if abs_diff.dim() == 3:
+        # [B, N, C] -> sum over N and C
+        abs_diff_sum = abs_diff.sum(dim=(1, 2))  # [B]
+        target_abs_sum = torch.abs(target).sum(dim=(1, 2))  # [B]
+    else:
+        # [B, T, N, C] -> sum over T, N, and C
+        abs_diff_sum = abs_diff.sum(dim=(1, 2, 3))  # [B]
+        target_abs_sum = torch.abs(target).sum(dim=(1, 2, 3))  # [B]
+    
+    # Relative L1: mean over batch
+    rel_l1 = (abs_diff_sum / (target_abs_sum + eps)).mean().item()
+    
+    # Compute L2 difference
+    l2_diff = torch.sqrt(((pred - target) ** 2).sum(dim=tuple(range(1, pred.dim()))))  # [B]
+    l2_target = torch.sqrt((target ** 2).sum(dim=tuple(range(1, target.dim()))))  # [B]
+    
+    # Relative L2: mean over batch
+    rel_l2 = (l2_diff / (l2_target + eps)).mean().item()
+    
+    return {"rel_l1": rel_l1, "rel_l2": rel_l2}

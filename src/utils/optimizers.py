@@ -209,7 +209,12 @@ class AdamOptimizer:
             #     print(f"[DEBUG OPTIMIZER] Epoch {epoch} end: computed train_loss={train_loss:.6f} (total_loss/{num_batches_from_len})")
             val_loss = None
             if (epoch + 1) % self.eval_every_eps == 0:
-                val_loss = trainer.validate(trainer.val_loader)
+                val_result = trainer.validate(trainer.val_loader)
+                # Handle both dict return (new) and float return (old) for backward compatibility
+                if isinstance(val_result, dict):
+                    val_loss = val_result.get("loss", 0.0)
+                else:
+                    val_loss = val_result
                 pbar.set_postfix({"loss": train_loss, "val_loss": val_loss})
                 val_losses.append(val_loss)
                 val_epochs.append(epoch)
@@ -477,9 +482,19 @@ class AdamWOptimizer:
 
             # epoch-end eval
             train_loss = total_loss.cpu().item() / len(trainer.train_loader)
+            val_result = None
             val_loss = None
+            val_rel_l1 = None
+            val_rel_l2 = None
             if (epoch + 1) % self.eval_every_eps == 0:
-                val_loss = trainer.validate(trainer.val_loader)
+                val_result = trainer.validate(trainer.val_loader)
+                # Handle both dict return (new) and float return (old) for backward compatibility
+                if isinstance(val_result, dict):
+                    val_loss = val_result.get("loss", 0.0)
+                    val_rel_l1 = val_result.get("rel_l1", 0.0)
+                    val_rel_l2 = val_result.get("rel_l2", 0.0)
+                else:
+                    val_loss = val_result
                 pbar.set_postfix({"loss": train_loss, "val_loss": val_loss})
                 val_losses.append(val_loss)
                 val_epochs.append(epoch)
@@ -501,25 +516,18 @@ class AdamWOptimizer:
                 trainer.save_ckpt_epoch(epoch=epoch + 1)
 
             # W&B epoch logging
-            _wb_log(
-                trainer,
-                {
-                    "train/epoch": epoch,
-                    "train/loss": float(train_loss),
-                    **({"valid/loss": float(val_loss)} if val_loss is not None else {}),
-                    "train/lr": _current_lr(self.optimizer, self.scheduler),
-                },
-                step=global_step,
-            )
-
-            # inside AdamWOptimizer.optimize(...) after computing val_loss
-            if getattr(trainer, "wandb_run", None):
-                trainer.wandb_run.log({
-                    "epoch": epoch + 1,
-                    "train/loss": train_loss,
-                    "val/loss": val_loss,
-                    "lr": self.optimizer.param_groups[0]["lr"],
-                })
+            wb_payload = {
+                "train/epoch": epoch,
+                "train/loss": float(train_loss),
+                "train/lr": _current_lr(self.optimizer, self.scheduler),
+            }
+            if val_loss is not None:
+                wb_payload["valid/loss"] = float(val_loss)
+                if val_rel_l1 is not None:
+                    wb_payload["valid/rel_l1"] = float(val_rel_l1)
+                if val_rel_l2 is not None:
+                    wb_payload["valid/rel_l2"] = float(val_rel_l2)
+            _wb_log(trainer, wb_payload, step=global_step)
 
 
         if best_state is not None:

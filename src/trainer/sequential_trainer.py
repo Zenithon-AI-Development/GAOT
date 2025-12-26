@@ -13,7 +13,7 @@ from ..datasets.sequential_data_processor import SequentialDataProcessor
 from ..datasets.graph_builder import GraphBuilder
 from ..datasets.data_utils import TestDataset, collate_sequential_batch
 from ..model.gaot import GAOT
-from ..utils.metrics import compute_batch_errors, compute_final_metric
+from ..utils.metrics import compute_batch_errors, compute_final_metric, compute_rel_l1_l2_normalized
 from ..utils.plotting import plot_estimates, create_sequential_animation, plot_estimates_1d, create_sequential_animation_1d
 from ..datasets.well_h5_sequential_data_processor_hs import WellH5SequentialDataProcessor
 from ..datasets.well_h5_sequential_data_processor_trl2d import WellH5SequentialDataProcessorTRL2D
@@ -506,21 +506,42 @@ class SequentialTrainer(BaseTrainer):
     def validate(self, loader):
         """Validate the model on validation set."""
         if loader is None:
-            return 0.0
+            return {"loss": 0.0, "rel_l1": 0.0, "rel_l2": 0.0}
         
         self.model.eval()
         total_loss = 0.0
+        all_rel_l1 = []
+        all_rel_l2 = []
+        num_batches = 0
         
         with torch.no_grad():
             for batch in loader:
                 if self.coord_mode == 'fx':
-                    loss = self._validate_fixed_coords(batch)
+                    result = self._validate_fixed_coords(batch)
                 else:
-                    loss = self._validate_variable_coords(batch)
+                    result = self._validate_variable_coords(batch)
                 
-                total_loss += loss.item()
+                if isinstance(result, dict):
+                    loss = result["loss"]
+                    all_rel_l1.append(result["rel_l1"])
+                    all_rel_l2.append(result["rel_l2"])
+                else:
+                    # Backward compatibility: if only loss is returned
+                    loss = result
+                
+                total_loss += loss.item() if isinstance(loss, torch.Tensor) else loss
+                num_batches += 1
         
-        return total_loss / len(loader)
+        # Use actual number of batches processed, not len(loader)
+        # len(loader) can be incorrect for IterableDatasets
+        if num_batches == 0:
+            return {"loss": 0.0, "rel_l1": 0.0, "rel_l2": 0.0}
+        
+        avg_loss = total_loss / num_batches
+        avg_rel_l1 = np.mean(all_rel_l1) if all_rel_l1 else 0.0
+        avg_rel_l2 = np.mean(all_rel_l2) if all_rel_l2 else 0.0
+        
+        return {"loss": avg_loss, "rel_l1": avg_rel_l1, "rel_l2": avg_rel_l2}
     
     def _validate_fixed_coords(self, batch):
         """Validation step for fixed coordinates."""
@@ -554,6 +575,8 @@ class SequentialTrainer(BaseTrainer):
         #     f"y μσ: {y_batch.mean().item():.5f} {y_batch.std().item():.5f}")
 
         loss_val = self.loss_fn(pred, y_batch)
+        # Compute relative L1 and L2 on normalized data
+        rel_metrics = compute_rel_l1_l2_normalized(pred, y_batch)
         # if not hasattr(self, "_val_loss_debug_printed"):
         #     self._val_loss_debug_printed = True
         #     print(f"\n[DEBUG VAL] Validation loss computation (first batch):")
@@ -571,7 +594,7 @@ class SequentialTrainer(BaseTrainer):
         #     print(f"  Using stats from self.stats: mean shape={self.stats['u']['mean'].shape}, first 3={self.stats['u']['mean'].flatten()[:3].tolist()}")
         #     print(f"  metadata.global_mean (should match): first 3={self.metadata.global_mean[:3]}")
         #     print(f"  metadata.global_std (should match): first 3={self.metadata.global_std[:3]}")
-        return loss_val
+        return {"loss": loss_val, "rel_l1": rel_metrics["rel_l1"], "rel_l2": rel_metrics["rel_l2"]}
     
     def _validate_variable_coords(self, batch):
         """Validation step for variable coordinates."""
@@ -608,7 +631,10 @@ class SequentialTrainer(BaseTrainer):
                 decoder_nbrs=decoder_graph_batch
             )
         
-        return self.loss_fn(pred, y_batch)
+        loss_val = self.loss_fn(pred, y_batch)
+        # Compute relative L1 and L2 on normalized data
+        rel_metrics = compute_rel_l1_l2_normalized(pred, y_batch)
+        return {"loss": loss_val, "rel_l1": rel_metrics["rel_l1"], "rel_l2": rel_metrics["rel_l2"]}
     
     def _call_model_autoregressive_predict(self, x_batch, time_indices, coord_batch=None):
         """
@@ -1168,7 +1194,7 @@ class SequentialTrainer(BaseTrainer):
 
     def _test_streaming_pairs(self, mode: str = "pairs"):
         """Pair-based evaluation path for streaming datasets (IterableDataset)."""
-        from ..utils.metrics import compute_batch_errors, compute_final_metric
+        from ..utils.metrics import compute_batch_errors, compute_final_metric, compute_rel_l1_l2_normalized
         self.model.eval()
         all_relative_errors = []
         all_mse_losses = []  # Track MSE loss (same as training metric)
