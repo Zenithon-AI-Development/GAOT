@@ -1,5 +1,8 @@
 name: maglif-wandb-sweep
 
+file_mounts:
+  /home/shared_info/new_processed_maglif: gs://data-share-bucket-zenithon/new_processed_maglif
+
 resources:
   cpus: 4
   accelerators: T4:1
@@ -19,10 +22,6 @@ run: |
   cd /tmp/gaot
   conda activate gaot_env
   export WANDB_API_KEY=2936a88d0916e4ae7a5ee81bd02146e1c9967367
-  mkdir -p /home/shared_info
-  echo "Syncing only maglif dataset from GCS bucket..."
-  gsutil -m rsync -r gs://data-share-bucket-zenithon/new_processed_maglif /home/shared_info/new_processed_maglif
-  echo "Dataset sync completed, starting training..."
   wandb agent ${SWEEP_ID} --count 20 -- --config config/examples/time_dep/maglif.json
   if [ -d .ckpt ] || [ -d .loss ] || [ -d .results ] || [ -d .database ]; then
     gsutil -m cp -r .ckpt .loss .results .database gs://data-share-bucket-zenithon/gaot_sweep_results/ 2>&1 || echo "Results sync to GCS completed"
