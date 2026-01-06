@@ -1,7 +1,11 @@
 name: maglif-wandb-sweep
 
 file_mounts:
+  /tmp/gaot: /home/david.voderholzer/GAOT
   /home/shared_info/new_processed_maglif: gs://data-share-bucket-zenithon/new_processed_maglif
+  /tmp/gcs_checkpoints: gs://zen_ml_checkpoints
+  /tmp/gcs_logs: gs://zen_ml_logs
+  /tmp/gcs_data: gs://zen_ml_data
 
 resources:
   cpus: 4
@@ -12,7 +16,6 @@ resources:
 num_nodes: 1
 
 setup: |
-  git clone -b development https://github.com/Zenithon-AI-Development/GAOT.git /tmp/gaot
   cd /tmp/gaot
   conda activate gaot_env
   export WANDB_API_KEY=2936a88d0916e4ae7a5ee81bd02146e1c9967367
@@ -22,8 +25,9 @@ run: |
   cd /tmp/gaot
   conda activate gaot_env
   export WANDB_API_KEY=2936a88d0916e4ae7a5ee81bd02146e1c9967367
-  wandb agent ${SWEEP_ID} --count 20 -- --config config/examples/time_dep/maglif.json
-  if [ -d .ckpt ] || [ -d .loss ] || [ -d .results ] || [ -d .database ]; then
-    gsutil -m cp -r .ckpt .loss .results .database gs://data-share-bucket-zenithon/gaot_sweep_results/ 2>&1 || echo "Results sync to GCS completed"
-  fi
+  export GAOT_CHECKPOINTS_DIR=/tmp/gcs_checkpoints/gaot_maglif_sweep
+  export GAOT_LOGS_DIR=/tmp/gcs_logs/gaot_maglif_sweep
+  export GAOT_DATA_DIR=/tmp/gcs_data/gaot_maglif_sweep
+  mkdir -p ${GAOT_CHECKPOINTS_DIR} ${GAOT_LOGS_DIR} ${GAOT_DATA_DIR}
+  wandb agent ${SWEEP_ID} --count 20 -- --config config/examples/time_dep/maglif_sweep_gcs.json
 

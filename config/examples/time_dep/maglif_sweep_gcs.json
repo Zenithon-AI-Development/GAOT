@@ -1,0 +1,91 @@
+{
+    "setup": {
+        "seed": 42,
+        "device": "cuda:0",
+        "dtype": "torch.float32",
+        "trainer_name": "sequential",
+        "train": true,
+        "test": false,
+        "ckpt": false
+    },
+
+    "model": {
+        "name": "gaot",
+        "latent_tokens_size": [64],
+        "use_conditional_norm": false,
+        "args": {
+            "magno": {
+                "coord_dim": 1,
+                "scales": [1],
+                "use_scale_weights": true,
+                "radius": 0.1,
+                "hidden_size": 64,
+                "mlp_layers": 3,
+                "lifting_channels": 64
+            },
+            "transformer": {
+                "patch_size": 2,
+                "hidden_size": 256
+            }
+        }
+    },
+
+    "dataset": {
+        "backend": "well_maglif",
+        "name": "new_processed_maglif",
+        "metaname": "benchmarking/maglif",
+        "base_path": "/home/shared_info/",
+        "use_metadata_stats": false,
+        "use_sparse": false,
+        "train_size": -1,
+        "val_size": -1,
+        "test_size": -1,
+        "max_time_diff": 4,
+        "time_step": 4,
+        "coord_scaling": "global_scaling",
+        "batch_size": 64,
+        "num_workers": 0,
+        "shuffle": true,
+        "metric": "final_step",
+        "predict_mode": "all",
+        "stepper_mode": "output"
+    },
+
+    "optimizer": {
+        "name": "adamw",
+        "args": {
+            "lr": 8e-4,
+            "weight_decay": 1e-05,
+            "epoch": 1000,
+            "loss_scale": 1.0,
+            "eval_every_eps": 5,
+            "scheduler": "mix",
+            "max_lr": 1e-3,
+            "min_lr": 1e-4,
+            "final_lr": 5e-5
+        }
+    },
+
+    "path": {
+        "ckpt_path": "/tmp/gcs_checkpoints/gaot_maglif_sweep/checkpoints/maglif.pt",
+        "loss_path": "/tmp/gcs_logs/gaot_maglif_sweep/loss/maglif.png",
+        "result_path": "/tmp/gcs_logs/gaot_maglif_sweep/results/maglif.png",
+        "database_path": "/tmp/gcs_data/gaot_maglif_sweep/database/maglif.csv"
+    },
+
+    "wandb": {
+        "enabled": true,
+        "project": "gaot-maglif",
+        "entity": "Zenithon-AI",
+        "group": "maglif",
+        "run_name": "GAOT_test_maglif",
+        "mode": "online",
+        "tags": ["GAOT","DEMO"],
+        "watch_log": "all",
+        "watch_freq": 10,
+        "log_interval": 5,
+        "save_code": true,
+        "dir": "/tmp/gcs_logs/gaot_maglif_sweep/wandb"
+    }
+}
+
