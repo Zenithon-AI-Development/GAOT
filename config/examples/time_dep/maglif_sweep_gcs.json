@@ -11,7 +11,7 @@
 
     "model": {
         "name": "gaot",
-        "latent_tokens_size": [128],
+        "latent_tokens_size": [64],
         "use_conditional_norm": false,
         "args": {
             "magno": {
@@ -19,7 +19,7 @@
                 "scales": [1],
                 "use_scale_weights": true,
                 "radius": 0.1,
-                "hidden_size": 128,
+                "hidden_size": 64,
                 "mlp_layers": 3,
                 "lifting_channels": 64
             },
@@ -43,7 +43,7 @@
         "max_time_diff": 4,
         "time_step": 4,
         "coord_scaling": "global_scaling",
-        "batch_size": 128,
+        "batch_size": 64,
         "num_workers": 0,
         "shuffle": true,
         "metric": "final_step",
@@ -67,10 +67,10 @@
     },
 
     "path": {
-        "ckpt_path": ".ckpt/examples/time_dep/maglif_v3.pt",
-        "loss_path": ".loss/examples/time_dep/maglif_v3.png",
-        "result_path": ".results/examples/time_dep/maglif_v3.png",
-        "database_path": ".database/examples/time_dep/maglif_v3.csv"
+        "ckpt_path": "/tmp/gcs_checkpoints/gaot_maglif_sweep/checkpoints/maglif.pt",
+        "loss_path": "/tmp/gcs_logs/gaot_maglif_sweep/loss/maglif.png",
+        "result_path": "/tmp/gcs_logs/gaot_maglif_sweep/results/maglif.png",
+        "database_path": "/tmp/gcs_data/gaot_maglif_sweep/database/maglif.csv"
     },
 
     "wandb": {
@@ -78,12 +78,14 @@
         "project": "gaot-maglif",
         "entity": "Zenithon-AI",
         "group": "maglif",
-        "run_name": "GAOT_maglif_v3",
+        "run_name": "GAOT_test_maglif",
         "mode": "online",
         "tags": ["GAOT","DEMO"],
         "watch_log": "all",
         "watch_freq": 10,
         "log_interval": 5,
-        "save_code": true
-  }
+        "save_code": true,
+        "dir": "/tmp/gcs_logs/gaot_maglif_sweep/wandb"
+    }
 }
+
