@@ -995,13 +995,18 @@ def create_sequential_animation_1d(
         gt_torch = torch.from_numpy(gt_sequence).float()  # [T, N, C]
         pred_torch = torch.from_numpy(pred_sequence).float()  # [T, N, C]
         
-        # Re-normalize using metadata stats (like compute_batch_errors does)
-        metadata_mean = torch.tensor(metadata.global_mean, dtype=torch.float32).reshape(1, 1, -1)
-        metadata_std = torch.tensor(metadata.global_std, dtype=torch.float32).reshape(1, 1, -1)
+        # Use provided u_mean/u_std if available (preferred), otherwise fall back to metadata
+        if u_mean is not None and u_std is not None:
+            mean_tensor = torch.tensor(u_mean, dtype=torch.float32).reshape(1, 1, -1)
+            std_tensor = torch.tensor(u_std, dtype=torch.float32).reshape(1, 1, -1)
+        else:
+            # Fall back to metadata stats
+            mean_tensor = torch.tensor(metadata.global_mean, dtype=torch.float32).reshape(1, 1, -1)
+            std_tensor = torch.tensor(metadata.global_std, dtype=torch.float32).reshape(1, 1, -1)
         
-        # Re-normalize using metadata stats
-        gt_renorm = (gt_torch - metadata_mean) / metadata_std  # [T, N, C]
-        pred_renorm = (pred_torch - metadata_mean) / metadata_std  # [T, N, C]
+        # Re-normalize using stats
+        gt_renorm = (gt_torch - mean_tensor) / std_tensor  # [T, N, C]
+        pred_renorm = (pred_torch - mean_tensor) / std_tensor  # [T, N, C]
         
         # Compute GAOT relative error: sum(|error|) / sum(|gt|) across all channels and space
         abs_error = torch.abs(pred_renorm - gt_renorm)  # [T, N, C]

@@ -1,0 +1,30 @@
+program: main.py
+method: random
+metric:
+  name: valid/loss
+  goal: minimize
+parameters:
+  model.latent_tokens_size:
+    values:
+      - [64]
+      - [128]
+      - [256]
+  model.args.magno.scales:
+    values:
+      - [1]
+      - [1, 2]
+      - [1, 2, 3]
+  model.args.magno.radius:
+    distribution: log_uniform_values
+    min: 0.05
+    max: 0.2
+  model.args.magno.hidden_size:
+    values:
+      - 64
+      - 128
+  model.args.transformer.hidden_size:
+    values:
+      - 128
+      - 256
+      - 512
+
