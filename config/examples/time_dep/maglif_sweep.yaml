@@ -27,4 +27,9 @@ parameters:
       - 128
       - 256
       - 512
+  dataset.normalization_mode:
+    values:
+      - standard
+      - log
+      - quantile
 

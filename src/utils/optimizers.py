@@ -446,6 +446,11 @@ class AdamWOptimizer:
         for epoch in range(self.epoch):
             trainer.model.train()
             total_loss = 0.0
+            
+            # Reset accumulators for maglif rel_l1/l2 metrics at start of each epoch
+            if hasattr(trainer, "_train_rel_l1_accum"):
+                trainer._train_rel_l1_accum = []
+                trainer._train_rel_l2_accum = []
 
             for batch in trainer.train_loader:
                 self.optimizer.zero_grad()
@@ -482,6 +487,14 @@ class AdamWOptimizer:
 
             # epoch-end eval
             train_loss = total_loss.cpu().item() / len(trainer.train_loader)
+            
+            # For maglif: compute average rel_l1/rel_l2 from accumulated values
+            train_rel_l1 = None
+            train_rel_l2 = None
+            if hasattr(trainer, "_train_rel_l1_accum") and len(trainer._train_rel_l1_accum) > 0:
+                train_rel_l1 = np.mean(trainer._train_rel_l1_accum)
+                train_rel_l2 = np.mean(trainer._train_rel_l2_accum)
+            
             val_result = None
             val_loss = None
             val_rel_l1 = None
@@ -521,6 +534,11 @@ class AdamWOptimizer:
                 "train/loss": float(train_loss),
                 "train/lr": _current_lr(self.optimizer, self.scheduler),
             }
+            # For maglif: add train rel_l1/rel_l2
+            if train_rel_l1 is not None:
+                wb_payload["train/rel_l1"] = float(train_rel_l1)
+            if train_rel_l2 is not None:
+                wb_payload["train/rel_l2"] = float(train_rel_l2)
             if val_loss is not None:
                 wb_payload["valid/loss"] = float(val_loss)
                 if val_rel_l1 is not None:

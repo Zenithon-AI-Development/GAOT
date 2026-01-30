@@ -516,8 +516,33 @@ class GAOT(nn.Module):
                 )
                 predictions.append(pred_denorm)
                 
-                # Update current state for next iteration
-                current_u = (pred_denorm - u_mean) / u_std
+                # Update current state for next iteration (re-normalize according to normalization_mode)
+                normalization_mode = stats.get("normalization_mode", "standard")
+                norm_params_1 = stats.get("norm_params_1", None)
+                field_names = stats.get("field_names", None)
+                
+                if normalization_mode == "log" and norm_params_1 is not None:
+                    # Apply log/asinh normalization before standardizing
+                    signed_fields = ["Vel", "jz"]
+                    norm_params_1_dev = norm_params_1.to(pred_denorm.device) if isinstance(norm_params_1, torch.Tensor) else norm_params_1
+                    result = torch.zeros_like(pred_denorm)
+                    for ch_idx in range(pred_denorm.shape[-1]):
+                        if field_names is not None and ch_idx < len(field_names) and field_names[ch_idx] in signed_fields:
+                            # asinh normalization
+                            scale = float(norm_params_1_dev[ch_idx]) if len(norm_params_1_dev) > ch_idx else 1.0
+                            scale = max(scale, 1e-10)
+                            result[..., ch_idx] = torch.asinh(pred_denorm[..., ch_idx] / scale)
+                        else:
+                            # log normalization
+                            offset = float(norm_params_1_dev[ch_idx]) if len(norm_params_1_dev) > ch_idx else 1e-6
+                            result[..., ch_idx] = torch.log(pred_denorm[..., ch_idx] + offset)
+                    # Standardize: (normalized - mean) / std
+                    u_mean_sq = u_mean.squeeze(0) if u_mean.dim() > 1 else u_mean
+                    u_std_sq = u_std.squeeze(0) if u_std.dim() > 1 else u_std
+                    current_u = (result - u_mean_sq) / u_std_sq
+                else:
+                    # Standard normalization
+                    current_u = (pred_denorm - u_mean) / u_std
         
         return torch.stack(predictions, dim=1)  # [batch_size, num_timesteps-1, num_nodes, output_dim]
     
@@ -539,15 +564,36 @@ class GAOT(nn.Module):
         Returns:
             Denormalized prediction
         """
+        from ..core.trainer_utils import denormalize_data_maglif
+        normalization_mode = stats.get("normalization_mode", "standard")
+        norm_params_1 = stats.get("norm_params_1", None)
+        norm_params_2 = stats.get("norm_params_2", None)
+        field_names = stats.get("field_names", None)
+        
+        # Helper to denormalize u data
+        def _denorm_u(data):
+            if normalization_mode in ["log", "quantile"] and norm_params_1 is not None:
+                norm_params_1_dev = norm_params_1.to(data.device) if isinstance(norm_params_1, torch.Tensor) else norm_params_1
+                norm_params_2_dev = norm_params_2.to(data.device) if norm_params_2 is not None and isinstance(norm_params_2, torch.Tensor) else norm_params_2
+                u_mean_dev = u_mean.to(data.device) if isinstance(u_mean, torch.Tensor) else u_mean
+                u_std_dev = u_std.to(data.device) if isinstance(u_std, torch.Tensor) else u_std
+                if u_mean_dev.dim() > 1:
+                    u_mean_dev = u_mean_dev.squeeze(0)
+                if u_std_dev.dim() > 1:
+                    u_std_dev = u_std_dev.squeeze(0)
+                return denormalize_data_maglif(data, u_mean_dev, u_std_dev, normalization_mode, norm_params_1_dev, norm_params_2_dev, field_names)
+            else:
+                return data * u_std + u_mean
+        
         if stepper_mode == "output":
-            pred_denorm = pred * u_std + u_mean
+            pred_denorm = _denorm_u(pred)
             
         elif stepper_mode == "residual":
             res_mean = stats["res"]["mean"].to(pred.device)
             res_std = stats["res"]["std"].to(pred.device)
             pred_denorm_res = pred * res_std + res_mean
             
-            current_u_denorm = current_u * u_std + u_mean
+            current_u_denorm = _denorm_u(current_u)
             pred_denorm = current_u_denorm + pred_denorm_res
             
         elif stepper_mode == "time_der":
@@ -555,7 +601,7 @@ class GAOT(nn.Module):
             der_std = stats["der"]["std"].to(pred.device)
             pred_denorm_der = pred * der_std + der_mean
             
-            current_u_denorm = current_u * u_std + u_mean
+            current_u_denorm = _denorm_u(current_u)
             time_diff_tensor = torch.tensor(time_diff, dtype=pred.dtype, device=pred.device)
             pred_denorm = current_u_denorm + time_diff_tensor * pred_denorm_der
             

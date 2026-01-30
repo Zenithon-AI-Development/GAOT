@@ -286,7 +286,7 @@ class BaseTrainer(ABC):
             if len(ax[1].get_legend_handles_labels()) > 0:
                 ax[1].legend()
             ax[1].set_xlim(left=0)
-            if (np.array(val_losses) > 0).all():
+            if len(val_losses) > 0 and (np.array(val_losses) > 0).all():
                 ax[1].set_yscale('log')
             
             os.makedirs(os.path.dirname(self.path_config.loss_path), exist_ok=True)

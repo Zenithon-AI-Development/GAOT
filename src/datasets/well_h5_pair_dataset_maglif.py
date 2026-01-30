@@ -95,6 +95,8 @@ class WellH5PairIterableMagLIF(IterableDataset):
         max_time_diff: Optional[int],
         field_names: List[str],
         cache_samples: int = 1,
+        normalization_mode: str = "standard",
+        sample_ratio: Optional[float] = None,
     ):
         super().__init__()
         self.files = sorted(glob.glob(os.path.join(split_dir, "*.hdf5")))
@@ -105,6 +107,9 @@ class WellH5PairIterableMagLIF(IterableDataset):
         self.max_time_diff = None if (max_time_diff is None) else int(max_time_diff)
         self.field_names = list(field_names)
         self.cache_samples = int(cache_samples)
+        self.normalization_mode = normalization_mode
+        self.signed_fields = ["Vel", "jz"]  # Fields that use asinh normalization
+        self.sample_ratio = sample_ratio  # Subsampling ratio for all2all training (None = no subsampling)
 
         self._cache: Dict[str, Dict[str, torch.Tensor]] = {}
         self._order: List[str] = []
@@ -181,14 +186,93 @@ class WellH5PairIterableMagLIF(IterableDataset):
             uTNC, t_vals = self._read_all_TNC(fp)  # (T, N, Cu), (T,)
             T, N, Cu = uTNC.shape
             ti, to = build_time_pairs(T, self.max_time_diff, self.time_step)
+            
+            # Apply subsampling if enabled
+            if self.sample_ratio is not None and self.sample_ratio < 1.0:
+                n_pairs = len(ti)
+                n_sample = max(1, int(n_pairs * self.sample_ratio))
+                if n_sample < n_pairs:
+                    indices = np.random.choice(n_pairs, size=n_sample, replace=False)
+                    indices = np.sort(indices)  # Keep temporal order
+                    ti = ti[indices]
+                    to = to[indices]
 
             for i, o in zip(ti, to):
                 u_in  = uTNC[i]  # [N, Cu]
                 u_out = uTNC[o]
 
-                # Normalize u
-                u_in_norm = (u_in - u_mean) / u_std
-                y         = (u_out - u_mean) / u_std
+                # Normalize u according to normalization_mode
+                if self.normalization_mode == "log":
+                    # Apply channel-specific normalization (log or asinh)
+                    norm_params_1 = self.stats.get("norm_params_1", None)
+                    if norm_params_1 is None:
+                        raise ValueError("norm_params_1 not found in stats for log normalization")
+                    norm_params_1 = norm_params_1.to(u_in.device) if isinstance(norm_params_1, torch.Tensor) else torch.tensor(norm_params_1, device=u_in.device, dtype=u_in.dtype)
+                    u_in_norm = torch.zeros_like(u_in)
+                    y = torch.zeros_like(u_out)
+                    
+                    for ch_idx, field_name in enumerate(self.field_names):
+                        if field_name in self.signed_fields:
+                            # asinh normalization for signed fields
+                            scale = float(norm_params_1[ch_idx]) if len(norm_params_1) > ch_idx else 1.0
+                            scale = max(scale, 1e-10)
+                            u_in_norm[:, ch_idx] = torch.asinh(u_in[:, ch_idx] / scale)
+                            y[:, ch_idx] = torch.asinh(u_out[:, ch_idx] / scale)
+                        else:
+                            # log normalization for other fields
+                            offset = float(norm_params_1[ch_idx]) if len(norm_params_1) > ch_idx else 1e-6
+                            u_in_norm[:, ch_idx] = torch.log(u_in[:, ch_idx] + offset)
+                            y[:, ch_idx] = torch.log(u_out[:, ch_idx] + offset)
+                    
+                    # Standardize: (normalized - mean) / std
+                    u_in_norm = (u_in_norm - u_mean) / u_std
+                    y = (y - u_mean) / u_std
+                elif self.normalization_mode == "quantile":
+                    # Apply quantile normalization per channel
+                    norm_params_1 = self.stats.get("norm_params_1", None)
+                    norm_params_2 = self.stats.get("norm_params_2", None)
+                    if norm_params_1 is None or norm_params_2 is None:
+                        raise ValueError("norm_params_1 and norm_params_2 not found in stats for quantile normalization")
+                    
+                    num_quantiles = int(norm_params_2[0])
+                    num_channels = int(norm_params_2[1])
+                    quantiles_array = norm_params_1.reshape(num_channels, num_quantiles).cpu().numpy()
+                    
+                    u_in_norm = torch.zeros_like(u_in)
+                    y = torch.zeros_like(u_out)
+                    
+                    from scipy import interpolate
+                    from scipy.stats import norm
+                    
+                    for ch_idx in range(u_in.shape[-1]):
+                        # Normalize input
+                        ch_values_in = u_in[:, ch_idx].cpu().numpy()
+                        ch_quantiles = np.sort(quantiles_array[ch_idx])
+                        quantile_ranks = np.linspace(0, 1, len(ch_quantiles))
+                        
+                        interp_func = interpolate.interp1d(
+                            ch_quantiles, quantile_ranks,
+                            kind='linear',
+                            bounds_error=False,
+                            fill_value=(0.0, 1.0)
+                        )
+                        ranks_in = np.clip(interp_func(ch_values_in), 0.0, 1.0)
+                        ranks_in_clipped = np.clip(ranks_in, 0.001, 0.999)
+                        u_in_norm[:, ch_idx] = torch.from_numpy(norm.ppf(ranks_in_clipped)).to(u_in.device)
+                        
+                        # Normalize output
+                        ch_values_out = u_out[:, ch_idx].cpu().numpy()
+                        ranks_out = np.clip(interp_func(ch_values_out), 0.0, 1.0)
+                        ranks_out_clipped = np.clip(ranks_out, 0.001, 0.999)
+                        y[:, ch_idx] = torch.from_numpy(norm.ppf(ranks_out_clipped)).to(u_out.device)
+                    
+                    # Standardize: (normalized - mean) / std
+                    u_in_norm = (u_in_norm - u_mean) / u_std
+                    y = (y - u_mean) / u_std
+                else:
+                    # Standard normalization
+                    u_in_norm = (u_in - u_mean) / u_std
+                    y = (u_out - u_mean) / u_std
                 # if not hasattr(self, "_first_sample_printed"):
                 #     self._first_sample_printed = True
                 #     print(f"[DEBUG DATASET] First sample normalization check:")

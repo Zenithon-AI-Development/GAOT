@@ -82,6 +82,12 @@ class DatasetConfig:
     metric: str = "final_step"                                  # Evaluation metric: ["final_step", "all_step"]
     predict_mode: str = "all"                                   # Inference mode: ["all", "autoregressive", "direct", "star"]
     stepper_mode: str = "time_der"                                # Stepper mode: ["output", "residual", "time_der"]
+    normalization_mode: str = "standard"                        # Normalization mode: ["standard", "log", "quantile"]
+    
+    # Rollout training and subsampling (for MagLIF pipeline)
+    rollout_steps: int = 0                                      # Number of rollout steps in training loss (0 = disabled, 1-5 recommended)
+    rollout_weight_decay: float = 0.8                           # Exponential decay weight for rollout steps (1.0 = equal weight)
+    sample_ratio: Optional[float] = None                        # Subsampling ratio for all2all training (None = no subsampling, 0.1-0.2 recommended)
 
 
 @dataclass

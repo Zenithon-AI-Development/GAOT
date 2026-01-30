@@ -145,8 +145,185 @@ def normalize_data(data: torch.Tensor, mean: torch.Tensor, std: torch.Tensor):
 
 
 def denormalize_data(data: torch.Tensor, mean: torch.Tensor, std: torch.Tensor):
-    """Denormalize data using provided mean and std."""
+    """Denormalize data using provided mean and std (standard normalization)."""
     return data * std + mean
+
+
+def denormalize_data_maglif(
+    data: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    normalization_mode: str,
+    norm_params_1: Optional[torch.Tensor] = None,
+    norm_params_2: Optional[torch.Tensor] = None,
+    field_names: Optional[List[str]] = None,
+) -> torch.Tensor:
+    """
+    Denormalize data for MagLIF dataset with support for log/asinh/quantile normalization.
+    
+    Args:
+        data: Normalized data tensor [..., C] or [..., N, C]
+        mean: Mean tensor [1, C] or [C]
+        std: Std tensor [1, C] or [C]
+        normalization_mode: "standard", "log", or "quantile"
+        norm_params_1: Normalization parameters (offsets for log, scales for asinh, quantiles for quantile) [C] or [C*num_quantiles]
+        norm_params_2: Additional params (for quantile: [num_quantiles, num_channels])
+        field_names: List of field names for channel-specific normalization
+    
+    Returns:
+        Denormalized data in original physical units
+    """
+    if normalization_mode == "standard":
+        # Standard denormalization: data * std + mean
+        if mean.dim() == 1 and data.dim() > 1:
+            mean = mean.unsqueeze(0)
+        if std.dim() == 1 and data.dim() > 1:
+            std = std.unsqueeze(0)
+        return data * std + mean
+    
+    elif normalization_mode == "log":
+        # Log/asinh denormalization: first undo standardization, then apply inverse transform
+        if mean.dim() == 1 and data.dim() > 1:
+            mean = mean.unsqueeze(0)
+        if std.dim() == 1 and data.dim() > 1:
+            std = std.unsqueeze(0)
+        
+        # Undo standardization: data_std * std + mean gives normalized (log/asinh) values
+        data_normalized = data * std + mean
+        
+        # Apply inverse transform per channel
+        signed_fields = ["Vel", "jz"]  # Fields that use asinh normalization
+        if norm_params_1 is None:
+            raise ValueError("norm_params_1 must be provided for log normalization")
+        
+        # Handle different tensor shapes
+        if data.dim() == 2:  # [B, C] or [N, C]
+            result = torch.zeros_like(data)
+            for ch_idx in range(data.shape[-1]):
+                if field_names is not None and ch_idx < len(field_names) and field_names[ch_idx] in signed_fields:
+                    # asinh denormalization: scale * sinh(normalized)
+                    scale = float(norm_params_1[ch_idx]) if len(norm_params_1) > ch_idx else 1.0
+                    scale = max(scale, 1e-10)
+                    result[:, ch_idx] = scale * torch.sinh(data_normalized[:, ch_idx])
+                else:
+                    # log denormalization: exp(normalized) - offset
+                    offset = float(norm_params_1[ch_idx]) if len(norm_params_1) > ch_idx else 1e-6
+                    result[:, ch_idx] = torch.exp(data_normalized[:, ch_idx]) - offset
+            return result
+        elif data.dim() == 3:  # [B, N, C]
+            result = torch.zeros_like(data)
+            for ch_idx in range(data.shape[-1]):
+                if field_names is not None and ch_idx < len(field_names) and field_names[ch_idx] in signed_fields:
+                    scale = float(norm_params_1[ch_idx]) if len(norm_params_1) > ch_idx else 1.0
+                    scale = max(scale, 1e-10)
+                    result[:, :, ch_idx] = scale * torch.sinh(data_normalized[:, :, ch_idx])
+                else:
+                    offset = float(norm_params_1[ch_idx]) if len(norm_params_1) > ch_idx else 1e-6
+                    result[:, :, ch_idx] = torch.exp(data_normalized[:, :, ch_idx]) - offset
+            return result
+        elif data.dim() == 4:  # [B, T, N, C]
+            result = torch.zeros_like(data)
+            for ch_idx in range(data.shape[-1]):
+                if field_names is not None and ch_idx < len(field_names) and field_names[ch_idx] in signed_fields:
+                    scale = float(norm_params_1[ch_idx]) if len(norm_params_1) > ch_idx else 1.0
+                    scale = max(scale, 1e-10)
+                    result[:, :, :, ch_idx] = scale * torch.sinh(data_normalized[:, :, :, ch_idx])
+                else:
+                    offset = float(norm_params_1[ch_idx]) if len(norm_params_1) > ch_idx else 1e-6
+                    result[:, :, :, ch_idx] = torch.exp(data_normalized[:, :, :, ch_idx]) - offset
+            return result
+        else:
+            raise ValueError(f"Unsupported data dimension for denormalization: {data.dim()}")
+    
+    elif normalization_mode == "quantile":
+        # Quantile denormalization: unstandardize, then map from standard normal to quantile rank, then to original values
+        if mean.dim() == 1 and data.dim() > 1:
+            mean = mean.unsqueeze(0)
+        if std.dim() == 1 and data.dim() > 1:
+            std = std.unsqueeze(0)
+        
+        # Undo standardization: data_std * std + mean gives standard normal values
+        data_std_normal = data * std + mean
+        
+        if norm_params_1 is None or norm_params_2 is None:
+            raise ValueError("norm_params_1 and norm_params_2 must be provided for quantile normalization")
+        
+        num_quantiles = int(norm_params_2[0].item() if isinstance(norm_params_2, torch.Tensor) else norm_params_2[0])
+        num_channels = int(norm_params_2[1].item() if isinstance(norm_params_2, torch.Tensor) else norm_params_2[1])
+        
+        # Reshape quantiles: [num_channels, num_quantiles]
+        quantiles_flat = norm_params_1.cpu().numpy() if isinstance(norm_params_1, torch.Tensor) else norm_params_1
+        quantiles_array = quantiles_flat.reshape(num_channels, num_quantiles)
+        
+        from scipy.stats import norm
+        from scipy import interpolate
+        
+        # Handle different tensor shapes
+        if data.dim() == 2:  # [B, C] or [N, C]
+            result = torch.zeros_like(data)
+            data_np = data_std_normal.cpu().numpy()
+            for ch_idx in range(data.shape[-1]):
+                ch_normal = data_np[:, ch_idx]
+                ch_quantiles = np.sort(quantiles_array[ch_idx])
+                quantile_ranks = np.linspace(0, 1, len(ch_quantiles))
+                
+                # Map from standard normal to quantile ranks using CDF
+                ranks = norm.cdf(ch_normal)
+                ranks = np.clip(ranks, 0.0, 1.0)
+                
+                # Map quantile ranks to original values using interpolation
+                interp_func = interpolate.interp1d(
+                    quantile_ranks, ch_quantiles,
+                    kind='linear',
+                    bounds_error=False,
+                    fill_value=(ch_quantiles[0], ch_quantiles[-1])
+                )
+                result[:, ch_idx] = torch.from_numpy(interp_func(ranks)).to(data.device)
+            return result
+        elif data.dim() == 3:  # [B, N, C]
+            result = torch.zeros_like(data)
+            data_np = data_std_normal.cpu().numpy()
+            for ch_idx in range(data.shape[-1]):
+                ch_normal = data_np[:, :, ch_idx].flatten()
+                ch_quantiles = np.sort(quantiles_array[ch_idx])
+                quantile_ranks = np.linspace(0, 1, len(ch_quantiles))
+                
+                ranks = norm.cdf(ch_normal)
+                ranks = np.clip(ranks, 0.0, 1.0)
+                
+                interp_func = interpolate.interp1d(
+                    quantile_ranks, ch_quantiles,
+                    kind='linear',
+                    bounds_error=False,
+                    fill_value=(ch_quantiles[0], ch_quantiles[-1])
+                )
+                denorm_flat = interp_func(ranks)
+                result[:, :, ch_idx] = torch.from_numpy(denorm_flat.reshape(data_np[:, :, ch_idx].shape)).to(data.device)
+            return result
+        elif data.dim() == 4:  # [B, T, N, C]
+            result = torch.zeros_like(data)
+            data_np = data_std_normal.cpu().numpy()
+            for ch_idx in range(data.shape[-1]):
+                ch_normal = data_np[:, :, :, ch_idx].flatten()
+                ch_quantiles = np.sort(quantiles_array[ch_idx])
+                quantile_ranks = np.linspace(0, 1, len(ch_quantiles))
+                
+                ranks = norm.cdf(ch_normal)
+                ranks = np.clip(ranks, 0.0, 1.0)
+                
+                interp_func = interpolate.interp1d(
+                    quantile_ranks, ch_quantiles,
+                    kind='linear',
+                    bounds_error=False,
+                    fill_value=(ch_quantiles[0], ch_quantiles[-1])
+                )
+                denorm_flat = interp_func(ranks)
+                result[:, :, :, ch_idx] = torch.from_numpy(denorm_flat.reshape(data_np[:, :, :, ch_idx].shape)).to(data.device)
+            return result
+        else:
+            raise ValueError(f"Unsupported data dimension for denormalization: {data.dim()}")
+    else:
+        raise ValueError(f"Unknown normalization_mode: {normalization_mode}. Must be 'standard', 'log', or 'quantile'.")
 
 
 class EarlyStopping:

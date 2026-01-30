@@ -148,7 +148,15 @@ class GeometricEmbedding(nn.Module):
             if has_neighbors.any():
                 # covariance matrices
                 cov_matrix_valid = cov_matrix[has_neighbors]                                                 # Shape: [num_valid_queries, num_dims, num_dims]
-                eigenvalues = torch.linalg.eigvalsh(cov_matrix_valid)                                        # Shape: [num_valid_queries, num_dims]
+                # Try CUDA eigvalsh first, fallback to CPU if CUDA solver fails
+                try:
+                    eigenvalues = torch.linalg.eigvalsh(cov_matrix_valid)                                    # Shape: [num_valid_queries, num_dims]
+                except RuntimeError as e:
+                    if "cusolver" in str(e).lower() or "cuda" in str(e).lower():
+                        # Fallback to CPU computation for eigvalsh
+                        eigenvalues = torch.linalg.eigvalsh(cov_matrix_valid.cpu()).to(device)              # Shape: [num_valid_queries, num_dims]
+                    else:
+                        raise
                 eigenvalues = eigenvalues.flip(dims=[1])
                 PCA_features[has_neighbors] = eigenvalues
 
