@@ -34,7 +34,7 @@
         "backend": "well_maglif",
         "name": "new_processed_maglif",
         "metaname": "benchmarking/maglif",
-        "base_path": "/home/shared_info/",
+        "base_path": "/home/workspace/projects/",
         "use_metadata_stats": false,
         "use_sparse": false,
         "train_size": -1,
