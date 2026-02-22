@@ -206,9 +206,10 @@ def denormalize_data_maglif(
                     scale = max(scale, 1e-10)
                     result[:, ch_idx] = scale * torch.sinh(data_normalized[:, ch_idx])
                 else:
-                    # log denormalization: exp(normalized) - offset
+                    # log denormalization: exp(normalized) - offset; clamp to avoid overflow in exp (e.g. rollout)
                     offset = float(norm_params_1[ch_idx]) if len(norm_params_1) > ch_idx else 1e-6
-                    result[:, ch_idx] = torch.exp(data_normalized[:, ch_idx]) - offset
+                    v = data_normalized[:, ch_idx].clamp(-20.0, 20.0)
+                    result[:, ch_idx] = torch.exp(v) - offset
             return result
         elif data.dim() == 3:  # [B, N, C]
             result = torch.zeros_like(data)
@@ -219,7 +220,8 @@ def denormalize_data_maglif(
                     result[:, :, ch_idx] = scale * torch.sinh(data_normalized[:, :, ch_idx])
                 else:
                     offset = float(norm_params_1[ch_idx]) if len(norm_params_1) > ch_idx else 1e-6
-                    result[:, :, ch_idx] = torch.exp(data_normalized[:, :, ch_idx]) - offset
+                    v = data_normalized[:, :, ch_idx].clamp(-20.0, 20.0)
+                    result[:, :, ch_idx] = torch.exp(v) - offset
             return result
         elif data.dim() == 4:  # [B, T, N, C]
             result = torch.zeros_like(data)
@@ -230,7 +232,8 @@ def denormalize_data_maglif(
                     result[:, :, :, ch_idx] = scale * torch.sinh(data_normalized[:, :, :, ch_idx])
                 else:
                     offset = float(norm_params_1[ch_idx]) if len(norm_params_1) > ch_idx else 1e-6
-                    result[:, :, :, ch_idx] = torch.exp(data_normalized[:, :, :, ch_idx]) - offset
+                    v = data_normalized[:, :, :, ch_idx].clamp(-20.0, 20.0)
+                    result[:, :, :, ch_idx] = torch.exp(v) - offset
             return result
         else:
             raise ValueError(f"Unsupported data dimension for denormalization: {data.dim()}")
