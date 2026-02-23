@@ -483,7 +483,7 @@ class GAOT(nn.Module):
                             latent_tokens_coord=latent_tokens_coord,
                             xcoord=fixed_coord,  # Will be updated for vx mode
                             pndata=x_input[..., :-1],
-                            condition=x_input[..., 0, -2:-1],
+                            condition=x_input[..., 0, -1:],
                             encoder_nbrs=encoder_nbrs,
                             decoder_nbrs=decoder_nbrs
                         )
@@ -492,7 +492,7 @@ class GAOT(nn.Module):
                             latent_tokens_coord=latent_tokens_coord,
                             xcoord=fixed_coord,
                             pndata=x_input[..., :-1],
-                            condition=x_input[..., 0, -2:-1]
+                            condition=x_input[..., 0, -1:]
                         )
                 else:
                     if is_variable_coords:

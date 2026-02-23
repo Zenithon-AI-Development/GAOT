@@ -15,19 +15,60 @@ def dprint(*args, **kwargs):
 # ------ small HDF5 helpers ----------------------------------------------------
 def _probe_WH_C_T(fp: str, key: str) -> Tuple[int, int, int, int]:
     with h5py.File(fp, "r") as f:
-        d = f[key]
+        item = f[key]
+        if isinstance(item, h5py.Group):
+            names = sorted(item.keys())
+            if not names:
+                raise RuntimeError(f"Empty group {key} in {fp}")
+            first = item[names[0]]
+            shp = first.shape
+            C = len(names)
+            if len(shp) == 5:   # (B,T,W,H)
+                return int(shp[2]), int(shp[3]), C, int(shp[1])
+            elif len(shp) == 4:  # (B,T,W,H) -> return (W,H,C,T)
+                return int(shp[2]), int(shp[3]), C, int(shp[1])
+            raise RuntimeError(f"Unsupported rank {len(shp)} for group {key} in {fp}")
+        d = item
         shp = d.shape
         if len(shp) == 5:   # (B,T,W,H,C)
             return int(shp[2]), int(shp[3]), int(shp[4]), int(shp[1])
         elif len(shp) == 4: # (T,W,H,C)
             return int(shp[1]), int(shp[2]), int(shp[3]), int(shp[0])
-        else:
-            raise RuntimeError(f"Unsupported rank {len(shp)} for {key} in {fp}")
+        raise RuntimeError(f"Unsupported rank {len(shp)} for {key} in {fp}")
 
 def _traj_T(fp: str, key: str) -> int:
+    """Return time length T. For (B,T,W,H) or (B,T,W,H,C), T is axis 1."""
     with h5py.File(fp, "r") as f:
-        d = f[key]
-        return int(d.shape[1] if len(d.shape) == 5 else d.shape[0])
+        item = f[key]
+        if isinstance(item, h5py.Group):
+            names = sorted(item.keys())
+            first = item[names[0]]
+            return int(first.shape[1] if len(first.shape) >= 4 else first.shape[0])
+        d = item
+        return int(d.shape[1] if len(d.shape) >= 4 else d.shape[0])
+
+def _read_u_chunk(f, key, bi: Optional[int], t_slice: slice) -> np.ndarray:
+    """Read time chunk from f[key]; return (chunk_T, W, H, C). (B,T,W,H): time axis 1, use d[0,t_slice]."""
+    item = f[key]
+    if isinstance(item, h5py.Group):
+        names = sorted(item.keys())
+        parts = []
+        for n in names:
+            d = item[n]
+            if len(d.shape) == 5:
+                x = np.array(d[bi, t_slice], copy=False)
+            elif len(d.shape) == 4:
+                x = np.array(d[0, t_slice], copy=False)  # (B,T,W,H) -> (T_slice,W,H)
+            else:
+                x = np.array(d[t_slice], copy=False)
+            parts.append(x)
+        return np.stack(parts, axis=-1)
+    d = item
+    if len(d.shape) == 5:
+        return np.array(d[bi, t_slice], copy=False)
+    if len(d.shape) == 4:
+        return np.array(d[0, t_slice], copy=False)  # (B,T,W,H)
+    return np.array(d[t_slice], copy=False)
 
 # ------ streamed stats (u/c) --------------------------------------------------
 def _stream_mean_std_over_train(train_files: List[str], dataset_key: str,
@@ -37,29 +78,25 @@ def _stream_mean_std_over_train(train_files: List[str], dataset_key: str,
     c_sum = None; c_sumsq = None; total = 0
     for fp in files:
         with h5py.File(fp, "r") as f:
-            d = f[dataset_key]
-            if len(d.shape) == 5:   # (B,T,W,H,C) -> take first B dim
-                T = int(d.shape[1])
-                for t0 in range(0, T, chunk_T):
-                    t1 = min(t0 + chunk_T, T)
-                    x = np.array(d[0, t0:t1], copy=False)        # (chunk,W,H,C)
-                    X = x.reshape(-1, x.shape[-1]).astype(np.float32)
-            elif len(d.shape) == 4: # (T,W,H,C)
-                T = int(d.shape[0])
-                for t0 in range(0, T, chunk_T):
-                    t1 = min(t0 + chunk_T, T)
-                    x = np.array(d[t0:t1], copy=False)           # (chunk,W,H,C)
-                    X = x.reshape(-1, x.shape[-1]).astype(np.float32)
+            item = f[dataset_key]
+            if isinstance(item, h5py.Group):
+                names = sorted(item.keys())
+                first = item[names[0]]
+                T = int(first.shape[1] if len(first.shape) >= 4 else first.shape[0])  # (B,T,W,H): T=axis 1
+                bi = 0
             else:
-                raise RuntimeError(f"Unsupported rank {len(d.shape)} in {fp}:{dataset_key}")
-
-            if c_sum is None:
-                c_sum   = np.zeros(X.shape[-1], dtype=np.float64)
-                c_sumsq = np.zeros(X.shape[-1], dtype=np.float64)
-            c_sum   += X.sum(axis=0, dtype=np.float64)
-            c_sumsq += (X.astype(np.float64) ** 2).sum(axis=0)
-            total   += X.shape[0]
-
+                T = int(item.shape[1] if len(item.shape) >= 4 else item.shape[0])
+                bi = 0 if len(item.shape) >= 4 else None
+            for t0 in range(0, T, chunk_T):
+                t1 = min(t0 + chunk_T, T)
+                x = _read_u_chunk(f, dataset_key, bi, slice(t0, t1))
+                X = x.reshape(-1, x.shape[-1]).astype(np.float32)
+                if c_sum is None:
+                    c_sum   = np.zeros(X.shape[-1], dtype=np.float64)
+                    c_sumsq = np.zeros(X.shape[-1], dtype=np.float64)
+                c_sum   += X.sum(axis=0, dtype=np.float64)
+                c_sumsq += (X.astype(np.float64) ** 2).sum(axis=0)
+                total   += X.shape[0]
     mean = (c_sum / max(total, 1)).astype(np.float32)
     var  = (c_sumsq / max(total, 1) - mean.astype(np.float64)**2).astype(np.float32)
     var  = np.maximum(var, 1e-12); std = np.sqrt(var).astype(np.float32)
@@ -111,26 +148,23 @@ def _stream_pair_stats_over_train(train_files: List[str], dataset_key: str,
 
     for fp in train_files:
         with h5py.File(fp, "r") as f:
-            d = f[dataset_key]
-            # collapse to (T,W,H,C)
-            if len(d.shape) == 5:
-                arr = d[0]   # (T,W,H,C)
-            elif len(d.shape) == 4:
-                arr = d      # (T,W,H,C)
+            item = f[dataset_key]
+            if isinstance(item, h5py.Group):
+                first = item[sorted(item.keys())[0]]
+                T = int(first.shape[1] if len(first.shape) >= 4 else first.shape[0])  # (B,T,W,H): T=axis 1
+                bi = 0
             else:
-                raise RuntimeError(f"Unsupported rank {len(d.shape)} in {fp}:{dataset_key}")
-
-            T = int(arr.shape[0])
+                T = int(item.shape[1] if len(item.shape) >= 4 else item.shape[0])
+                bi = 0 if len(item.shape) >= 4 else None
             if T <= 1:
                 continue
             M = min(T-1, int(max_time_diff))
             if M < s:
                 continue
 
-            # stream in temporal chunks, but include a lookahead of M
             for t0 in range(0, T, chunk_T):
                 t1 = min(T, t0 + chunk_T + M)
-                x = np.array(arr[t0:t1], copy=False).astype(np.float32)  # (Tc,W,H,C)
+                x = _read_u_chunk(f, dataset_key, bi, slice(t0, t1)).astype(np.float32)
                 Tc, W, H, C = x.shape
                 if sum_c is None:
                     sum_c   = np.zeros(C, dtype=np.float64)
@@ -184,11 +218,35 @@ class GenericH5SequentialDataProcessor(SequentialDataProcessor):
         dprint("[H5SEQ] Loading and preprocessing sequential data...")
         base = self.dataset_config.base_path
         name = self.dataset_config.name
-        split_dirs = {
-            "train": os.path.join(base, name, "data", "train"),
-            "val":   os.path.join(base, name, "data", "valid"),
-            "test":  os.path.join(base, name, "data", "test"),
-        }
+        sub = getattr(self.dataset_config, "split_subdir", "data")
+        if sub:
+            split_dirs = {
+                "train": os.path.join(base, name, sub, "train"),
+                "val":   os.path.join(base, name, sub, "valid"),
+                "test":  os.path.join(base, name, sub, "test"),
+            }
+        else:
+            split_dirs = {
+                "train": os.path.join(base, name, "train"),
+                "val":   os.path.join(base, name, "valid"),
+                "test":  os.path.join(base, name, "test"),
+            }
+        # Fallback: if split_dirs with subdir missing, try without subdir (e.g. train/valid/test directly under name)
+        if not os.path.isdir(split_dirs["train"]):
+            fallback = {
+                "train": os.path.join(base, name, "train"),
+                "val":   os.path.join(base, name, "valid"),
+                "test":  os.path.join(base, name, "test"),
+            }
+            if os.path.isdir(fallback["train"]):
+                split_dirs = fallback
+        # Allow "val" as validation dir name when "valid" is missing (e.g. hermes3_blob2d layout)
+        val_dir = split_dirs["val"]
+        if not os.path.isdir(val_dir):
+            parent = os.path.dirname(val_dir)
+            val_alt = os.path.join(parent, "val")
+            if os.path.isdir(val_alt):
+                split_dirs["val"] = val_alt
         for k, d in split_dirs.items():
             if not os.path.isdir(d):
                 raise FileNotFoundError(f"Missing split directory: {d}")
@@ -304,6 +362,8 @@ class GenericH5SequentialDataProcessor(SequentialDataProcessor):
             }
         if DEBUG:
             dprint(f"[H5SEQ] stats[u]: mean/std shapes -> {tuple(stats['u']['mean'].shape)}, {tuple(stats['u']['std'].shape)}")
+            dprint(f"[H5SEQ] stats[u] mean (channels) = {stats['u']['mean'].cpu().numpy().ravel().tolist()}")
+            dprint(f"[H5SEQ] stats[u] std (channels)  = {stats['u']['std'].cpu().numpy().ravel().tolist()}")
             if "c" in stats:
                 dprint(f"[H5SEQ] stats[c]: mean/std shapes -> {tuple(stats['c']['mean'].shape)}, {tuple(stats['c']['std'].shape)}")
 
@@ -357,6 +417,7 @@ class GenericH5SequentialDataProcessor(SequentialDataProcessor):
                     "dataset_key": dataset_key,
                     "cond_key": cond_key,
                     "x_fixed": x_fixed.astype(np.float32),
+                    "resolution": (int(W0), int(H0)),  # (W, H) so pair iterable uses same grid
                     "time_step": step,
                     "max_time_diff": kmax,
                     "stepper_mode": getattr(self, "stepper_mode", "output"),
@@ -426,6 +487,7 @@ class GenericH5SequentialDataProcessor(SequentialDataProcessor):
                 dataset_key=meta["dataset_key"],
                 cond_key=meta["cond_key"],
                 x_fixed=meta["x_fixed"],                 # fx uses this; vx will ignore
+                resolution=meta.get("resolution"),      # (W, H) from processor so grid matches
                 stats=self.stats,
                 time_step=meta["time_step"],
                 max_time_diff=meta["max_time_diff"],

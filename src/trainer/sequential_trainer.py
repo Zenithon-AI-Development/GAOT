@@ -120,7 +120,11 @@ class SequentialTrainer(BaseTrainer):
                 # These two are used by utils/metrics.py
                 self.metadata.global_mean = mu.tolist()
                 self.metadata.global_std  = sd.tolist()
-                # (chunk mapping already handled by Metadata.active_variables/chunked_variables)
+                # Align active/chunked variables with channel count so all channels are used (e.g. blob2d)
+                C = len(mu)
+                self.metadata.active_variables = list(range(C))
+                self.metadata.chunked_variables = [0] * C
+                self.metadata.num_variable_chunks = 1
                 train_flag = getattr(self.setup_config, "train", True)
                 # print(f"[DEBUG NORM] Overwriting metadata stats with real stats from data processor (train={train_flag})")
                 # print(f"[DEBUG NORM] self.stats['u']['mean'] shape: {self.stats['u']['mean'].shape}, first 3 values: {self.stats['u']['mean'].flatten()[:3].tolist()}")
@@ -226,17 +230,18 @@ class SequentialTrainer(BaseTrainer):
         Denormalize u data according to normalization_mode.
         Helper method for consistent denormalization throughout the trainer.
         """
-        u_mean = self.stats["u"]["mean"].to(self.device)  # [1, Cu]
-        u_std = self.stats["u"]["std"].to(self.device)   # [1, Cu]
+        dev = data.device
+        u_mean = self.stats["u"]["mean"].to(dev)  # [1, Cu]
+        u_std = self.stats["u"]["std"].to(dev)   # [1, Cu]
         normalization_mode = self.stats.get("normalization_mode", "standard")
         norm_params_1 = self.stats.get("norm_params_1", None)
         norm_params_2 = self.stats.get("norm_params_2", None)
         field_names = self.stats.get("field_names", None)
         
         if normalization_mode in ["log", "quantile"] and norm_params_1 is not None:
-            norm_params_1 = norm_params_1.to(self.device)
+            norm_params_1 = norm_params_1.to(dev)
             if norm_params_2 is not None:
-                norm_params_2 = norm_params_2.to(self.device)
+                norm_params_2 = norm_params_2.to(dev)
             return denormalize_data_maglif(data, u_mean.squeeze(0), u_std.squeeze(0), normalization_mode, norm_params_1, norm_params_2, field_names)
         else:
             # Standard normalization
@@ -449,8 +454,10 @@ class SequentialTrainer(BaseTrainer):
             c = batch.get('coord', self.coord)
             return x, y, c
 
-        # Tuple / list
+        # Tuple / list (maglif may send 4-tuple: x, y, traj_end_time, lag_index; we drop extra for generic unpack)
         if isinstance(batch, (tuple, list)):
+            if len(batch) == 4:
+                return batch[0], batch[1], self.coord
             if len(batch) == 3:
                 return batch[0], batch[1], batch[2]
             if len(batch) == 2:
@@ -537,7 +544,7 @@ class SequentialTrainer(BaseTrainer):
                 xcoord=coord,
                 pndata=x_batch[..., :-1],         # exclude last time feature
                 timer=getattr(self, "timer", None),
-                condition=x_batch[..., 0, -2:-1]  # condition from time features
+                condition=x_batch[..., 0, -1:]     # dt_norm: forecast horizon
             )
         else:
             pred = self.model(
@@ -546,6 +553,18 @@ class SequentialTrainer(BaseTrainer):
                 pndata=x_batch,
                 timer=getattr(self, "timer", None)
             )
+
+        if not getattr(self, "_rel_debug_done", False):
+            self._rel_debug_done = True
+            with torch.no_grad():
+                mu = self.stats["u"]["mean"].cpu().numpy().ravel()
+                sd = self.stats["u"]["std"].cpu().numpy().ravel()
+                print(f"[REL_DEBUG] stats u mean[:3]={mu[:3].tolist()} std[:3]={sd[:3].tolist()}")
+                print(f"[REL_DEBUG] y_batch mean={y_batch.mean().item():.4f} std={y_batch.std().item():.4f} min={y_batch.min().item():.4f} max={y_batch.max().item():.4f}")
+                print(f"[REL_DEBUG] pred mean={pred.mean().item():.4f} std={pred.std().item():.4f} min={pred.min().item():.4f} max={pred.max().item():.4f}")
+                num = torch.abs(pred - y_batch).sum(dim=(1, 2))
+                den = torch.abs(y_batch).sum(dim=(1, 2)) + 1e-10
+                print(f"[REL_DEBUG] rel_l1 first_batch={(num / den).mean().item():.6f} num_sum={num.sum().item():.2f} den_sum={den.sum().item():.2f}")
         
         # print(f"[SANITY] pred μσ: {pred.mean().item():.5f} {pred.std().item():.5f} | "
         #     f"y μσ: {y_batch.mean().item():.5f} {y_batch.std().item():.5f}")
@@ -567,6 +586,9 @@ class SequentialTrainer(BaseTrainer):
         loss_train = self.loss_fn(pred, y_batch)
         
         # Rollout training: predict multiple steps and compute weighted loss
+        # For MagLIF: training pairs use lags [3, 12, 20] for ground truth targets,
+        # but we can rollout autoregressively up to rollout_steps (e.g., 100) for training stability.
+        # Steps beyond the first use consistency/regularization losses (no ground truth available).
         if rollout_steps > 0 and is_maglif:
             # Get time features from batch
             # x_batch shape: [B, N, Cu+2] where last 2 are [start_time, time_diff]
@@ -587,9 +609,57 @@ class SequentialTrainer(BaseTrainer):
             start_time = start_time_norm * st_sd + st_mu  # [B, 1, 1]
             time_diff = time_diff_norm * dt_sd + dt_mu    # [B, 1, 1]
             
-            # Build time indices for rollout: [0, 1, 2, ..., rollout_steps]
-            # We'll predict steps 1, 2, ..., rollout_steps from step 0
-            time_indices = np.arange(0, rollout_steps + 1, dtype=int)
+            # Cap rollout by trajectory end and by max timestep difference (max_rollout_lag, default 100).
+            # MagLIF dataset yields (x, y, traj_end_time, lag_index) so we can cap per sample.
+            max_rollout_lag = int(getattr(self.dataset_config, "max_rollout_lag", 100))
+            effective_rollout_steps = rollout_steps
+            if isinstance(batch, (tuple, list)) and len(batch) >= 4:
+                traj_end_times = batch[2]
+                lag_indices = batch[3]
+                if isinstance(traj_end_times, torch.Tensor):
+                    traj_end_times = traj_end_times.cpu().numpy()
+                else:
+                    traj_end_times = np.asarray(traj_end_times)
+                if isinstance(lag_indices, torch.Tensor):
+                    lag_indices = lag_indices.cpu().numpy()
+                else:
+                    lag_indices = np.asarray(lag_indices, dtype=np.int64)
+                start_times = start_time.squeeze().cpu().numpy() if start_time.numel() > 1 else np.array([float(start_time.item())])
+                time_diffs = time_diff.squeeze().cpu().numpy() if time_diff.numel() > 1 else np.array([float(time_diff.item())])
+                if start_times.size == 1 and B > 1:
+                    start_times = np.full(B, float(start_times.flat[0]))
+                if time_diffs.size == 1 and B > 1:
+                    time_diffs = np.full(B, float(time_diffs.flat[0]))
+                max_rollout_per_sample = []
+                for b in range(min(B, len(traj_end_times), len(lag_indices))):
+                    st = float(start_times[b]) if b < start_times.size else float(start_times.flat[0])
+                    dt = float(time_diffs[b]) if b < time_diffs.size else float(time_diffs.flat[0])
+                    end_t = float(traj_end_times[b])
+                    lag = int(lag_indices[b])
+                    by_traj = int((end_t - st) / dt) if dt > 1e-10 else rollout_steps
+                    by_lag = max_rollout_lag // lag if lag > 0 else rollout_steps
+                    max_rollout_per_sample.append(min(by_traj, by_lag))
+                if max_rollout_per_sample:
+                    effective_rollout_steps = min(rollout_steps, min(max_rollout_per_sample))
+                    effective_rollout_steps = max(1, effective_rollout_steps)
+            elif hasattr(self, 't_values') and self.t_values is not None:
+                t_vals_np = self.t_values.cpu().numpy() if torch.is_tensor(self.t_values) else np.asarray(self.t_values)
+                max_time = float(np.max(t_vals_np))
+                start_times = start_time.squeeze().cpu().numpy() if start_time.numel() > 1 else np.array([float(start_time.item())])
+                time_diffs = time_diff.squeeze().cpu().numpy() if time_diff.numel() > 1 else np.array([float(time_diff.item())])
+                max_rollout_per_sample = []
+                for st, dt in zip(np.atleast_1d(start_times).flat, np.atleast_1d(time_diffs).flat):
+                    if dt > 1e-10:
+                        max_rollout_per_sample.append(int((max_time - float(st)) / dt))
+                    else:
+                        max_rollout_per_sample.append(rollout_steps)
+                if max_rollout_per_sample:
+                    effective_rollout_steps = min(rollout_steps, min(max_rollout_per_sample))
+                    effective_rollout_steps = max(1, effective_rollout_steps)
+            
+            # Build time indices for rollout: [0, 1, 2, ..., effective_rollout_steps]
+            # We'll predict steps 1, 2, ..., effective_rollout_steps from step 0
+            time_indices = np.arange(0, effective_rollout_steps + 1, dtype=int)
             
             # Get initial state (denormalized)
             x_curr = x_batch.clone()  # [B, N, F]
@@ -597,10 +667,12 @@ class SequentialTrainer(BaseTrainer):
             u_curr = self._denormalize_u(u_curr_norm)  # [B, N, Cu]
             
             # Accumulate rollout losses
-            rollout_losses = [loss_train]  # First step loss
+            rollout_losses = [loss_train]  # First step loss (uses ground truth y_batch)
             
             # Perform autoregressive rollout
-            for step in range(1, min(rollout_steps + 1, len(time_indices))):
+            # Note: For steps > 1, we don't have ground truth targets, so we use consistency/regularization losses
+            # This is acceptable for training stability, but the primary loss is still the first-step loss
+            for step in range(1, min(effective_rollout_steps + 1, len(time_indices))):
                 # Compute time features for this step
                 t_prev = start_time + (step - 1) * time_diff  # [B, 1, 1]
                 t_curr = start_time + step * time_diff        # [B, 1, 1]
@@ -626,7 +698,7 @@ class SequentialTrainer(BaseTrainer):
                         xcoord=coord,
                         pndata=x_step[..., :-1],
                         timer=getattr(self, "timer", None),
-                        condition=x_step[..., 0, -2:-1]
+                        condition=x_step[..., 0, -1:]
                     )
                 else:
                     pred_step = self.model(
@@ -673,28 +745,17 @@ class SequentialTrainer(BaseTrainer):
             total_loss = sum(rollout_losses)
             loss_train = total_loss
         
-        # For maglif: compute rel_l1/rel_l2 on denormalized data (accumulated separately for epoch-average)
-        if is_maglif:
-            with torch.no_grad():
-                pred_denorm = self._denormalize_u(pred.detach())
-                y_denorm = self._denormalize_u(y_batch)
-                
-                # Compute rel_l1 and rel_l2 on denormalized data
-                abs_error = torch.abs(pred_denorm - y_denorm).sum(dim=tuple(range(1, pred_denorm.dim())))  # [B]
-                abs_target = torch.abs(y_denorm).sum(dim=tuple(range(1, y_denorm.dim())))  # [B]
-                rel_l1_batch = (abs_error / (abs_target + 1e-10)).mean().item()
-                
-                l2_error = torch.sqrt(((pred_denorm - y_denorm) ** 2).sum(dim=tuple(range(1, pred_denorm.dim()))))  # [B]
-                l2_target = torch.sqrt((y_denorm ** 2).sum(dim=tuple(range(1, y_denorm.dim()))))  # [B]
-                rel_l2_batch = (l2_error / (l2_target + 1e-10)).mean().item()
-                
-                # Accumulate for epoch-average computation
-                if not hasattr(self, "_train_rel_l1_accum"):
-                    self._train_rel_l1_accum = []
-                    self._train_rel_l2_accum = []
-                self._train_rel_l1_accum.append(rel_l1_batch)
-                self._train_rel_l2_accum.append(rel_l2_batch)
-        
+        # Accumulate rel_l1/rel_l2 for wandb (normalized space so comparable to MSE and GAOT relative error)
+        with torch.no_grad():
+            rel_metrics = compute_rel_l1_l2_normalized(pred.detach(), y_batch)
+            rel_l1_batch = rel_metrics["rel_l1"]
+            rel_l2_batch = rel_metrics["rel_l2"]
+            if not hasattr(self, "_train_rel_l1_accum"):
+                self._train_rel_l1_accum = []
+                self._train_rel_l2_accum = []
+            self._train_rel_l1_accum.append(rel_l1_batch)
+            self._train_rel_l2_accum.append(rel_l2_batch)
+
         return loss_train
 
     def _train_step_variable_coords(self, batch):
@@ -718,7 +779,7 @@ class SequentialTrainer(BaseTrainer):
                 xcoord=coord_batch,
                 pndata=x_batch[..., :-1],          # exclude last time feature
                 timer=getattr(self, "timer", None),
-                condition=x_batch[..., 0, -2:-1],  # condition from time features
+                condition=x_batch[..., 0, -1:],    # dt_norm: forecast horizon
                 encoder_nbrs=encoder_graph_batch if len(batch) > 3 else None,
                 decoder_nbrs=decoder_graph_batch if len(batch) > 3 else None
             )
@@ -733,31 +794,19 @@ class SequentialTrainer(BaseTrainer):
             )
         
         loss_train = self.loss_fn(pred, y_batch)
-        
-        # For maglif: compute rel_l1/rel_l2 on denormalized data (accumulated separately for epoch-average)
-        if self.coord_dim == 1 or getattr(self.dataset_config, "backend", "").lower() == "well_maglif":
-            with torch.no_grad():
-                pred_denorm = self._denormalize_u(pred.detach())
-                y_denorm = self._denormalize_u(y_batch)
-                
-                # Compute rel_l1 and rel_l2 on denormalized data
-                abs_error = torch.abs(pred_denorm - y_denorm).sum(dim=tuple(range(1, pred_denorm.dim())))  # [B]
-                abs_target = torch.abs(y_denorm).sum(dim=tuple(range(1, y_denorm.dim())))  # [B]
-                rel_l1_batch = (abs_error / (abs_target + 1e-10)).mean().item()
-                
-                l2_error = torch.sqrt(((pred_denorm - y_denorm) ** 2).sum(dim=tuple(range(1, pred_denorm.dim()))))  # [B]
-                l2_target = torch.sqrt((y_denorm ** 2).sum(dim=tuple(range(1, y_denorm.dim()))))  # [B]
-                rel_l2_batch = (l2_error / (l2_target + 1e-10)).mean().item()
-                
-                # Accumulate for epoch-average computation
-                if not hasattr(self, "_train_rel_l1_accum"):
-                    self._train_rel_l1_accum = []
-                    self._train_rel_l2_accum = []
-                self._train_rel_l1_accum.append(rel_l1_batch)
-                self._train_rel_l2_accum.append(rel_l2_batch)
-        
+
+        with torch.no_grad():
+            rel_metrics = compute_rel_l1_l2_normalized(pred.detach(), y_batch)
+            rel_l1_batch = rel_metrics["rel_l1"]
+            rel_l2_batch = rel_metrics["rel_l2"]
+            if not hasattr(self, "_train_rel_l1_accum"):
+                self._train_rel_l1_accum = []
+                self._train_rel_l2_accum = []
+            self._train_rel_l1_accum.append(rel_l1_batch)
+            self._train_rel_l2_accum.append(rel_l2_batch)
+
         return loss_train
-    
+
     def validate(self, loader):
         """Validate the model on validation set."""
         if loader is None:
@@ -816,7 +865,7 @@ class SequentialTrainer(BaseTrainer):
                 xcoord=coord,
                 pndata=x_batch[..., :-1],
                 timer=getattr(self, "timer", None),
-                condition=x_batch[..., 0, -2:-1]
+                condition=x_batch[..., 0, -1:]
             )
         else:
             pred = self.model(
@@ -831,24 +880,10 @@ class SequentialTrainer(BaseTrainer):
 
         loss_val = self.loss_fn(pred, y_batch)
         
-        # For maglif: compute rel_l1 and rel_l2 on denormalized data
-        if self.coord_dim == 1 or getattr(self.dataset_config, "backend", "").lower() == "well_maglif":
-            pred_denorm = self._denormalize_u(pred)
-            y_denorm = self._denormalize_u(y_batch)
-            
-            # Compute rel_l1 and rel_l2 on denormalized data
-            abs_error = torch.abs(pred_denorm - y_denorm).sum(dim=tuple(range(1, pred_denorm.dim())))  # [B]
-            abs_target = torch.abs(y_denorm).sum(dim=tuple(range(1, y_denorm.dim())))  # [B]
-            rel_l1 = (abs_error / (abs_target + 1e-10)).mean().item()
-            
-            l2_error = torch.sqrt(((pred_denorm - y_denorm) ** 2).sum(dim=tuple(range(1, pred_denorm.dim()))))  # [B]
-            l2_target = torch.sqrt((y_denorm ** 2).sum(dim=tuple(range(1, y_denorm.dim()))))  # [B]
-            rel_l2 = (l2_error / (l2_target + 1e-10)).mean().item()
-        else:
-            # For other datasets: use normalized data (backward compatibility)
-            rel_metrics = compute_rel_l1_l2_normalized(pred, y_batch)
-            rel_l1 = rel_metrics["rel_l1"]
-            rel_l2 = rel_metrics["rel_l2"]
+        # rel_l1/rel_l2 in normalized space (comparable to MSE and GAOT relative error)
+        rel_metrics = compute_rel_l1_l2_normalized(pred, y_batch)
+        rel_l1 = rel_metrics["rel_l1"]
+        rel_l2 = rel_metrics["rel_l2"]
         
         return {"loss": loss_val, "rel_l1": rel_l1, "rel_l2": rel_l2}
     
@@ -873,7 +908,7 @@ class SequentialTrainer(BaseTrainer):
                 xcoord=coord_batch,
                 pndata=x_batch[..., :-1],
                 timer=getattr(self, "timer", None),
-                condition=x_batch[..., 0, -2:-1],
+                condition=x_batch[..., 0, -1:],
                 encoder_nbrs=encoder_graph_batch,
                 decoder_nbrs=decoder_graph_batch
             )
@@ -889,24 +924,10 @@ class SequentialTrainer(BaseTrainer):
         
         loss_val = self.loss_fn(pred, y_batch)
         
-        # For maglif: compute rel_l1 and rel_l2 on denormalized data
-        if self.coord_dim == 1 or getattr(self.dataset_config, "backend", "").lower() == "well_maglif":
-            pred_denorm = self._denormalize_u(pred)
-            y_denorm = self._denormalize_u(y_batch)
-            
-            # Compute rel_l1 and rel_l2 on denormalized data
-            abs_error = torch.abs(pred_denorm - y_denorm).sum(dim=tuple(range(1, pred_denorm.dim())))  # [B]
-            abs_target = torch.abs(y_denorm).sum(dim=tuple(range(1, y_denorm.dim())))  # [B]
-            rel_l1 = (abs_error / (abs_target + 1e-10)).mean().item()
-            
-            l2_error = torch.sqrt(((pred_denorm - y_denorm) ** 2).sum(dim=tuple(range(1, pred_denorm.dim()))))  # [B]
-            l2_target = torch.sqrt((y_denorm ** 2).sum(dim=tuple(range(1, y_denorm.dim()))))  # [B]
-            rel_l2 = (l2_error / (l2_target + 1e-10)).mean().item()
-        else:
-            # For other datasets: use normalized data (backward compatibility)
-            rel_metrics = compute_rel_l1_l2_normalized(pred, y_batch)
-            rel_l1 = rel_metrics["rel_l1"]
-            rel_l2 = rel_metrics["rel_l2"]
+        # rel_l1/rel_l2 in normalized space (comparable to MSE and GAOT relative error)
+        rel_metrics = compute_rel_l1_l2_normalized(pred, y_batch)
+        rel_l1 = rel_metrics["rel_l1"]
+        rel_l2 = rel_metrics["rel_l2"]
         
         return {"loss": loss_val, "rel_l1": rel_l1, "rel_l2": rel_l2}
     
@@ -1030,7 +1051,7 @@ class SequentialTrainer(BaseTrainer):
                     xcoord=coord,
                     pndata=x_step[..., :-1],             # drop last time feature (matches your train/val)
                     timer=getattr(self, "timer", None),
-                    condition=x_step[..., 0, -2:-1]      # per-sample condition from the time features
+                    condition=x_step[..., 0, -1:]      # per-sample condition from the time features
                 )
             else:
                 pred_norm = self.model(
@@ -1138,7 +1159,7 @@ class SequentialTrainer(BaseTrainer):
                     xcoord=coord,  # Use the provided coordinates
                     pndata=x_step[..., :-1],             # drop last time feature (matches your train/val)
                     timer=getattr(self, "timer", None),
-                    condition=x_step[..., 0, -2:-1]      # per-sample condition from the time features
+                    condition=x_step[..., 0, -1:]      # per-sample condition from the time features
                 )
             else:
                 pred_norm = self.model(
@@ -1323,7 +1344,7 @@ class SequentialTrainer(BaseTrainer):
                         xcoord=coord,
                         pndata=x_in[..., :-1],
                         timer=getattr(self, "timer", None),
-                        condition=x_in[..., 0, -2:-1]
+                        condition=x_in[..., 0, -1:]
                     )
                 else:
                     pred_norm = self.model(
@@ -1553,7 +1574,7 @@ class SequentialTrainer(BaseTrainer):
                             xcoord=coord,
                             pndata=x_batch[..., :-1],
                             timer=getattr(self, "timer", None),
-                            condition=x_batch[..., 0, -2:-1]
+                            condition=x_batch[..., 0, -1:]
                         )
                     else:
                         pred = self.model(
@@ -1618,7 +1639,7 @@ class SequentialTrainer(BaseTrainer):
                             xcoord=coord_batch,
                             pndata=x_batch[..., :-1],
                             timer=getattr(self, "timer", None),
-                            condition=x_batch[..., 0, -2:-1],
+                            condition=x_batch[..., 0, -1:],
                             encoder_nbrs=encoder_graph_batch,
                             decoder_nbrs=decoder_graph_batch
                         )
@@ -1722,25 +1743,10 @@ class SequentialTrainer(BaseTrainer):
                 #     print(f"  MSE loss (on normalized): {mse_loss.item():.6f}")
                 #     print(f"  self.loss_fn reduction: {getattr(self.loss_fn, 'reduction', 'N/A')}")
                 
-                # For maglif: compute rel L1 and L2 on denormalized data (same as training/validation)
-                if self.coord_dim == 1 or getattr(self.dataset_config, "backend", "").lower() == "well_maglif":
-                    # Denormalize for rel_l1/l2 computation
-                    pred_denorm = self._denormalize_u(pred)
-                    y_denorm = self._denormalize_u(y_batch)
-                    
-                    abs_error = torch.abs(pred_denorm - y_denorm).sum(dim=tuple(range(1, pred_denorm.dim())))  # [B]
-                    abs_target = torch.abs(y_denorm).sum(dim=tuple(range(1, y_denorm.dim())))  # [B]
-                    rel_l1 = (abs_error / (abs_target + 1e-10)).mean().item()
-                    
-                    l2_error = torch.sqrt(((pred_denorm - y_denorm) ** 2).sum(dim=tuple(range(1, pred_denorm.dim()))))  # [B]
-                    l2_target = torch.sqrt((y_denorm ** 2).sum(dim=tuple(range(1, y_denorm.dim()))))  # [B]
-                    rel_l2 = (l2_error / (l2_target + 1e-10)).mean().item()
-                else:
-                    # For other problems: compute on normalized data (original method)
-                    abs_error_norm = torch.abs(pred - y_batch)
-                    abs_truth_norm = torch.abs(y_batch)
-                    rel_l1 = (abs_error_norm.sum() / (abs_truth_norm.sum() + 1e-10)).item()
-                    rel_l2 = (torch.sqrt((abs_error_norm**2).sum()) / (torch.sqrt((abs_truth_norm**2).sum()) + 1e-10)).item()
+                # rel_l1/rel_l2 in normalized space (comparable to MSE and GAOT relative error)
+                rel_metrics_batch = compute_rel_l1_l2_normalized(pred, y_batch)
+                rel_l1 = rel_metrics_batch["rel_l1"]
+                rel_l2 = rel_metrics_batch["rel_l2"]
                 
                 # For GAOT relative error: denormalize first (compute_batch_errors expects denormalized)
                 # Then compute_batch_errors will re-normalize using metadata.global_mean/std
@@ -2030,29 +2036,24 @@ class SequentialTrainer(BaseTrainer):
                     # overall["ms_per_traj"].append(ms_per_traj)
                     # overall["ms_per_sample_step"].append(ms_per_sample_step)
                     
-                    # Denormalize y_batch for compute_batch_errors and rel_l1/l2 (both expect denormalized data)
+                    # Denormalize y_batch for compute_batch_errors (expects denormalized)
                     # pred is already denormalized from autoregressive_predict
-                    y_batch_denorm = self._denormalize_u(y_batch)  # [B, K, N, Cu] -> [B, K, N, Cu] denormalized
+                    y_batch_denorm = self._denormalize_u(y_batch)  # [B, K, N, Cu] denormalized
                     
-                    # For maglif: compute rel_l1 and rel_l2 on denormalized data
-                    if self.coord_dim == 1 or getattr(self.dataset_config, "backend", "").lower() == "well_maglif":
+                    # rel_l1/rel_l2 in normalized space (comparable to train/val and GAOT relative error)
+                    is_maglif_test = self.coord_dim == 1 or getattr(self.dataset_config, "backend", "").lower() == "well_maglif"
+                    if is_maglif_test:
+                        pred_norm = self._normalize_u(pred)  # [B, K, N, Cu] normalized
                         metric_type = getattr(self.dataset_config, 'metric', 'final_step')
                         if metric_type == "final_step":
-                            # Use final timestep for rel_l1/l2
-                            pred_final = pred[:, -1, :, :]  # [B, N, Cu]
-                            y_final = y_batch_denorm[:, -1, :, :]  # [B, N, Cu]
+                            pred_final_norm = pred_norm[:, -1, :, :]  # [B, N, Cu]
+                            y_final_norm = y_batch[:, -1, :, :]  # [B, N, Cu] already normalized
                         else:
-                            # Use all timesteps (flatten time dimension)
-                            pred_final = pred.reshape(-1, pred.shape[-2], pred.shape[-1])  # [B*K, N, Cu]
-                            y_final = y_batch_denorm.reshape(-1, y_batch_denorm.shape[-2], y_batch_denorm.shape[-1])  # [B*K, N, Cu]
-                        
-                        abs_error = torch.abs(pred_final - y_final).sum(dim=tuple(range(1, pred_final.dim())))  # [B or B*K]
-                        abs_target = torch.abs(y_final).sum(dim=tuple(range(1, y_final.dim())))  # [B or B*K]
-                        rel_l1 = (abs_error / (abs_target + 1e-10)).mean().item()
-                        
-                        l2_error = torch.sqrt(((pred_final - y_final) ** 2).sum(dim=tuple(range(1, pred_final.dim()))))  # [B or B*K]
-                        l2_target = torch.sqrt((y_final ** 2).sum(dim=tuple(range(1, y_final.dim()))))  # [B or B*K]
-                        rel_l2 = (l2_error / (l2_target + 1e-10)).mean().item()
+                            pred_final_norm = pred_norm.reshape(-1, pred_norm.shape[-2], pred_norm.shape[-1])
+                            y_final_norm = y_batch.reshape(-1, y_batch.shape[-2], y_batch.shape[-1])
+                        rel_metrics_test = compute_rel_l1_l2_normalized(pred_final_norm, y_final_norm)
+                        rel_l1 = rel_metrics_test["rel_l1"]
+                        rel_l2 = rel_metrics_test["rel_l2"]
                     else:
                         rel_l1 = 0.0
                         rel_l2 = 0.0
@@ -2288,17 +2289,21 @@ class SequentialTrainer(BaseTrainer):
             traceback.print_exc()
     
     def _create_animation(self, example_data):
-        """Create and save animation for sequential data."""
+        """Create and save animation for sequential data.
+        Creates two animations:
+        1. Standard: uses current pred_sequence (may include some GT frames)
+        2. Fully autoregressive: all frames predicted from initial state only
+        """
         import gc
         try:
-            animation_path = self.path_config.result_path.replace('.png', '.gif')
+            base_animation_path = self.path_config.result_path.replace('.png', '.gif')
             gt_sequence = example_data['gt_sequence']      # [T, N, C] complete GT
-            pred_sequence = example_data['pred_sequence']  # [T, N, C] GT[0:lag] + predictions[lag:]
+            pred_sequence = example_data['pred_sequence']  # [T, N, C] current predictions
             coords = example_data['coords']                # [N, 2] or [N, 1]
             time_indices = example_data['time_indices']
             t_values_full = example_data['t_values']
             
-            # Get input data
+            # Get input data (initial state)
             input_data = example_data['input']
             if input_data.ndim == 3 and input_data.shape[0] == 1:
                 input_data = input_data[0]
@@ -2307,48 +2312,162 @@ class SequentialTrainer(BaseTrainer):
             t_vals_np = t_values_full.cpu().numpy() if torch.is_tensor(t_values_full) else np.asarray(t_values_full)
             time_values = [float(t_vals_np[idx]) for idx in time_indices]
             
-            # Check if this is 1D or 2D+
+            # Animation 1: Standard (current behavior)
+            animation_path_1 = base_animation_path.replace('.gif', '_standard.gif')
             if self.coord_dim == 1:
-                # Use 1D line animation with frame limit to avoid memory issues
-                # For ~20GB GPU instances, safe limit is ~200-300 frames
-                max_frames = 300  # Conservative limit for memory safety
+                max_frames = 300
                 create_sequential_animation_1d(
                     gt_sequence=gt_sequence,
                     pred_sequence=pred_sequence,
                     coords=coords,
-                    save_path=animation_path,
+                    save_path=animation_path_1,
                     input_data=input_data,
                     time_values=time_values,
-                    interval=50,  # Slower animation (50ms per frame)
+                    interval=50,
                     names=self.metadata.names['u'] if self.metadata.names.get('u') else None,
                     domain=self.metadata.domain_x if hasattr(self.metadata, 'domain_x') else None,
                     show_error=True,
-                    u_mean=example_data.get('u_mean'),  # Pass normalization stats
-                    u_std=example_data.get('u_std'),     # for correct error computation
+                    u_mean=example_data.get('u_mean'),
+                    u_std=example_data.get('u_std'),
                     max_frames=max_frames,
-                    metadata=self.metadata  # Pass metadata for GAOT relative error computation
+                    metadata=self.metadata
                 )
             else:
-                # Use 2D scatter animation
                 create_sequential_animation(
                     gt_sequence=gt_sequence,
                     pred_sequence=pred_sequence,
                     coords=coords,
-                    save_path=animation_path,
-                    input_data=input_data,  
+                    save_path=animation_path_1,
+                    input_data=input_data,
                     time_values=time_values,
-                    interval=50,  # Slower animation (50ms per frame)
+                    interval=50,
                     symmetric=self.metadata.signed['u'] if self.metadata.signed.get('u') else [True],
                     domain=self.metadata.domain_x if hasattr(self.metadata, 'domain_x') else None,
                     names=self.metadata.names['u'] if self.metadata.names.get('u') else None,
                     colorbar_type="light",
                     show_error=True,
-                    dynamic_colorscale=True,  # Adaptive colorscale for better contrast
-                    u_mean=example_data.get('u_mean'),  # Pass normalization stats
-                    u_std=example_data.get('u_std')     # for correct error computation
+                    dynamic_colorscale=True,
+                    u_mean=example_data.get('u_mean'),
+                    u_std=example_data.get('u_std')
                 )
+            print(f"Standard animation saved to {animation_path_1}")
             
-            print(f"Animation saved to {animation_path}")
+            # Animation 2: Fully autoregressive from initial state only
+            # Use step=3 to match training timesteps (training uses lags 3, 12, 20)
+            # Animation subsampling will handle visualization smoothness
+            max_available = len(t_vals_np) - 1  # Maximum available timesteps in trajectory
+            max_anim_steps = min(max_available, 100)  # Limit to avoid memory issues and stay within trajectory
+            animation_time_indices = np.arange(0, max_anim_steps + 1, 3, dtype=int)  # Step=3 to match training
+            
+            # Extract initial state from input_data (denormalized u from first sample)
+            u_dim = self.stats["u"]["mean"].shape[-1]
+            if isinstance(input_data, np.ndarray):
+                if input_data.ndim == 2:
+                    initial_u_denorm = torch.from_numpy(input_data[:, :u_dim]).to(self.device)  # [N, Cu]
+                else:
+                    initial_u_denorm = torch.from_numpy(input_data[0, :, :u_dim]).to(self.device)  # [N, Cu]
+            else:
+                if input_data.dim() == 2:
+                    initial_u_denorm = input_data[:, :u_dim].to(self.device)  # [N, Cu]
+                else:
+                    initial_u_denorm = input_data[0, :, :u_dim].to(self.device)  # [N, Cu]
+            
+            # Normalize initial state for model input
+            initial_u_norm = self._normalize_u(initial_u_denorm.unsqueeze(0))  # [1, N, Cu]
+            
+            # Build input with time features for first step
+            st_mu = float(self.stats["start_time"]["mean"])
+            st_sd = float(self.stats["start_time"]["std"])
+            dt_mu = float(self.stats["time_diffs"]["mean"])
+            dt_sd = float(self.stats["time_diffs"]["std"])
+            
+            t0_val = float(t_vals_np[animation_time_indices[0]])
+            if len(animation_time_indices) > 1:
+                dt_val = float(t_vals_np[animation_time_indices[1]] - t_vals_np[animation_time_indices[0]])
+            else:
+                dt_val = float(t_vals_np[-1] - t_vals_np[0]) / max(1, len(animation_time_indices) - 1)
+            
+            start_norm = (t0_val - st_mu) / (st_sd if st_sd > 0 else 1.0)
+            diff_norm = (dt_val - dt_mu) / (dt_sd if dt_sd > 0 else 1.0)
+            
+            N = initial_u_norm.shape[1]
+            st_feat = torch.full((1, N, 1), start_norm, dtype=torch.float32, device=self.device)
+            dt_feat = torch.full((1, N, 1), diff_norm, dtype=torch.float32, device=self.device)
+            x0_autoreg = torch.cat([initial_u_norm, st_feat, dt_feat], dim=-1)  # [1, N, Cu+2]
+            
+            # Fully autoregressive: _autoregressive_predict_trainer_side feeds each step's prediction as input to the next (no ground truth).
+            with torch.no_grad():
+                if self.coord_mode == 'fx':
+                    pred_autoreg = self._autoregressive_predict_trainer_side(x0_autoreg, animation_time_indices)
+                else:
+                    coord_for_autoreg = torch.from_numpy(coords).to(self.device) if isinstance(coords, np.ndarray) else coords.to(self.device)
+                    pred_autoreg = self._autoregressive_predict_trainer_side_with_coord(x0_autoreg, animation_time_indices, coord_for_autoreg)
+            
+            # pred_autoreg is [1, K, N, Cu] where K = len(animation_time_indices) - 1
+            # Build full sequence: [initial_state, pred_1, pred_2, ...]
+            initial_state_denorm = initial_u_denorm.cpu().numpy()  # [N, Cu]
+            pred_autoreg_denorm = pred_autoreg[0].cpu().numpy()  # [K, N, Cu]
+            pred_sequence_autoreg = np.concatenate([initial_state_denorm[np.newaxis, :, :], pred_autoreg_denorm], axis=0)  # [K+1, N, Cu]
+            
+            # Match length to gt_sequence if needed
+            if pred_sequence_autoreg.shape[0] < gt_sequence.shape[0]:
+                # Pad with last prediction
+                last_frame = pred_sequence_autoreg[-1:]
+                padding = np.repeat(last_frame, gt_sequence.shape[0] - pred_sequence_autoreg.shape[0], axis=0)
+                pred_sequence_autoreg = np.concatenate([pred_sequence_autoreg, padding], axis=0)
+            elif pred_sequence_autoreg.shape[0] > gt_sequence.shape[0]:
+                pred_sequence_autoreg = pred_sequence_autoreg[:gt_sequence.shape[0]]
+            
+            # Create time values for autoregressive animation
+            time_values_autoreg = [float(t_vals_np[idx]) for idx in animation_time_indices[:pred_sequence_autoreg.shape[0]]]
+            if len(time_values_autoreg) < pred_sequence_autoreg.shape[0]:
+                # Extrapolate time values
+                if len(time_values_autoreg) > 1:
+                    dt_avg = (time_values_autoreg[-1] - time_values_autoreg[0]) / (len(time_values_autoreg) - 1)
+                    for i in range(len(time_values_autoreg), pred_sequence_autoreg.shape[0]):
+                        time_values_autoreg.append(time_values_autoreg[-1] + dt_avg)
+                else:
+                    time_values_autoreg = [float(t_vals_np[0])] * pred_sequence_autoreg.shape[0]
+            
+            # Animation 2: Fully autoregressive
+            animation_path_2 = base_animation_path.replace('.gif', '_autoregressive.gif')
+            if self.coord_dim == 1:
+                max_frames = 300
+                create_sequential_animation_1d(
+                    gt_sequence=gt_sequence,
+                    pred_sequence=pred_sequence_autoreg,
+                    coords=coords,
+                    save_path=animation_path_2,
+                    input_data=input_data,
+                    time_values=time_values_autoreg[:pred_sequence_autoreg.shape[0]],
+                    interval=50,
+                    names=self.metadata.names['u'] if self.metadata.names.get('u') else None,
+                    domain=self.metadata.domain_x if hasattr(self.metadata, 'domain_x') else None,
+                    show_error=True,
+                    u_mean=example_data.get('u_mean'),
+                    u_std=example_data.get('u_std'),
+                    max_frames=max_frames,
+                    metadata=self.metadata
+                )
+            else:
+                create_sequential_animation(
+                    gt_sequence=gt_sequence,
+                    pred_sequence=pred_sequence_autoreg,
+                    coords=coords,
+                    save_path=animation_path_2,
+                    input_data=input_data,
+                    time_values=time_values_autoreg[:pred_sequence_autoreg.shape[0]],
+                    interval=50,
+                    symmetric=self.metadata.signed['u'] if self.metadata.signed.get('u') else [True],
+                    domain=self.metadata.domain_x if hasattr(self.metadata, 'domain_x') else None,
+                    names=self.metadata.names['u'] if self.metadata.names.get('u') else None,
+                    colorbar_type="light",
+                    show_error=True,
+                    dynamic_colorscale=True,
+                    u_mean=example_data.get('u_mean'),
+                    u_std=example_data.get('u_std')
+                )
+            print(f"Fully autoregressive animation saved to {animation_path_2}")
             
         except MemoryError as e:
             print(f"\n{'='*60}")
@@ -2623,9 +2742,9 @@ class SequentialTrainer(BaseTrainer):
         os.makedirs(animation_dir, exist_ok=True)
         
         # Build time indices for autoregressive prediction
-        max_rollout_steps = 50
+        max_rollout_steps = 100  # Increased from 50 to support longer rollouts
         time_step = int(getattr(self.dataset_config, 'time_step', 1))
-        time_indices = np.arange(0, min(max_rollout_steps, 101), time_step, dtype=int)
+        time_indices = np.arange(0, min(max_rollout_steps + 1, 101), time_step, dtype=int)
         time_indices_anim = time_indices[::10]  # Every 10th frame for animation
         
         # Sort by resolution key for consistent ordering
@@ -2743,3 +2862,4 @@ class SequentialTrainer(BaseTrainer):
                 traceback.print_exc()
         
         print(f"\n[PER-RESOLUTION] Evaluation complete for {split} split. Animations saved to: {animation_dir}")
+}")
