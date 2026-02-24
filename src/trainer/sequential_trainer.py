@@ -2862,4 +2862,3 @@ class SequentialTrainer(BaseTrainer):
                 traceback.print_exc()
         
         print(f"\n[PER-RESOLUTION] Evaluation complete for {split} split. Animations saved to: {animation_dir}")
-}")
