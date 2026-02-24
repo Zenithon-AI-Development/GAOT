@@ -322,10 +322,6 @@ class GenericH5PairIterable(IterableDataset):
                 x_in = torch.cat(feats, dim=-1)            # [N, Cu(+Cc)+2]
                 if DEBUG and not self._printed_first_pair:
                     dprint(f"[H5PAIR] first pair x_in shape={tuple(x_in.shape)} y shape={tuple(u_out.shape)}")
-                    dprint(f"[H5PAIR] first pair u_in (raw) min/mean/max={u_in.min().item():.4f}/{u_in.mean().item():.4f}/{u_in.max().item():.4f}")
-                    dprint(f"[H5PAIR] first pair u_out (raw) min/mean/max={u_out.min().item():.4f}/{u_out.mean().item():.4f}/{u_out.max().item():.4f}")
-                    dprint(f"[H5PAIR] first pair y (norm) min/mean/max={y.min().item():.4f}/{y.mean().item():.4f}/{y.max().item():.4f} ti={ti} to={to} lag={lag}")
-                    self._printed_first_pair = True
 
                 # targets according to stepper_mode
                 if self.stepper_mode == "output":
@@ -348,6 +344,12 @@ class GenericH5PairIterable(IterableDataset):
                         y = der
                 else:
                     raise ValueError(f"Unsupported stepper_mode: {self.stepper_mode}")
+
+                if DEBUG and not self._printed_first_pair:
+                    dprint(f"[H5PAIR] first pair u_in (raw) min/mean/max={u_in.min().item():.4f}/{u_in.mean().item():.4f}/{u_in.max().item():.4f}")
+                    dprint(f"[H5PAIR] first pair u_out (raw) min/mean/max={u_out.min().item():.4f}/{u_out.mean().item():.4f}/{u_out.max().item():.4f}")
+                    dprint(f"[H5PAIR] first pair y (norm) min/mean/max={y.min().item():.4f}/{y.mean().item():.4f}/{y.max().item():.4f} ti={ti} to={to} lag={lag}")
+                    self._printed_first_pair = True
 
                 if coords_g is None:
                     yield (x_in, y)                # fx
