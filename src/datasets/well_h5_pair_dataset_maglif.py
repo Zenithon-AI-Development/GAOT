@@ -38,16 +38,24 @@ def _list_field_datasets(h5: h5py.File, group: str) -> List[str]:
 def build_time_pairs(T: int, max_time_diff: Optional[int], time_step: int) -> Tuple[np.ndarray, np.ndarray]:
     """
     Build time index pairs for training.
+    For MagLIF: uses only timesteps 3, 12, 20 (optimal from autocorrelation analysis).
     Returns (input_indices, output_indices).
     """
     if T <= 1:
         return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
-    s = max(1, int(time_step))
+    
+    # MagLIF-specific: use only optimal timesteps from autocorrelation analysis
+    # Timesteps 3, 12, 20 correspond to optimal autocorrelation ~0.5 for different fields
+    # Ignore max_time_diff and time_step config for MagLIF to ensure all optimal lags are used
+    optimal_lags = [3, 12, 20]
+    
     ti, to = [], []
-    for lag in range(s, max_time_diff + 1, s):
-        for i in range(0, T - lag, 1):
-            ti.append(i)
-            to.append(i + lag)
+    for lag in optimal_lags:
+        # Only use lag if it fits within available timesteps
+        if lag < T:
+            for i in range(0, T - lag, 1):
+                ti.append(i)
+                to.append(i + lag)
     return np.asarray(ti, np.int64), np.asarray(to, np.int64)
 
 def _as_TN_C(arr: np.ndarray, field: str, T_hint: Optional[int]) -> np.ndarray:
@@ -97,9 +105,15 @@ class WellH5PairIterableMagLIF(IterableDataset):
         cache_samples: int = 1,
         normalization_mode: str = "standard",
         sample_ratio: Optional[float] = None,
+        files_list: Optional[List[str]] = None,
+        max_samples: Optional[int] = None,
     ):
         super().__init__()
-        self.files = sorted(glob.glob(os.path.join(split_dir, "*.hdf5")))
+        self.max_samples = int(max_samples) if max_samples is not None else None
+        if files_list is not None:
+            self.files = list(files_list)
+        else:
+            self.files = sorted(glob.glob(os.path.join(split_dir, "*.hdf5")))
         if not self.files:
             raise FileNotFoundError(f"No .hdf5 files in {split_dir}")
         self.stats = stats
@@ -182,6 +196,7 @@ class WellH5PairIterableMagLIF(IterableDataset):
         dt_mu = float(self.stats["time_diffs"]["mean"])
         dt_sd = float(self.stats["time_diffs"]["std"])
 
+        yielded = 0
         for fp in self.files:
             uTNC, t_vals = self._read_all_TNC(fp)  # (T, N, Cu), (T,)
             T, N, Cu = uTNC.shape
@@ -294,8 +309,13 @@ class WellH5PairIterableMagLIF(IterableDataset):
 
                 # Build input: [u_norm, start_time, time_diff]
                 x_in = torch.cat([u_in_norm, st_feat, td_feat], dim=-1)  # [N, Cu+2]
-                
-                yield (x_in, y)
+
+                traj_end_time = float(t_vals[T - 1])
+                lag_index = int(o - i)
+                yield (x_in, y, traj_end_time, lag_index)
+                yielded += 1
+                if self.max_samples is not None and yielded >= self.max_samples:
+                    return
 
 
 

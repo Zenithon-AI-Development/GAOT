@@ -314,6 +314,15 @@ class WellH5SequentialDataProcessorMagLIF(SequentialDataProcessor):
         train_files = sorted(glob.glob(os.path.join(split_dirs["train"], "*.hdf5")))
         val_files   = sorted(glob.glob(os.path.join(split_dirs["val"],   "*.hdf5")))
         test_files  = sorted(glob.glob(os.path.join(split_dirs["test"],  "*.hdf5")))
+        max_train = getattr(self.dataset_config, "max_train_files", None)
+        max_val   = getattr(self.dataset_config, "max_val_files", None)
+        max_test  = getattr(self.dataset_config, "max_test_files", None)
+        if max_train is not None:
+            train_files = train_files[:max_train]
+        if max_val is not None:
+            val_files = val_files[:max_val]
+        if max_test is not None:
+            test_files = test_files[:max_test]
         if not train_files:
             raise FileNotFoundError(f"No .hdf5 files found under {split_dirs['train']}")
 
@@ -422,6 +431,9 @@ class WellH5SequentialDataProcessorMagLIF(SequentialDataProcessor):
                 "field_names": field_names,
                 "time_step": time_step,
                 "max_time_diff": max_diff,
+                "train_files": train_files,
+                "val_files": val_files,
+                "test_files": test_files,
             }
         }
 
@@ -435,8 +447,9 @@ class WellH5SequentialDataProcessorMagLIF(SequentialDataProcessor):
         meta = data_splits["_stream_meta"]
 
         def mk(split):
-            # Only apply subsampling to training split
             sample_ratio = getattr(self.dataset_config, "sample_ratio", None) if split == "train" else None
+            files_list = meta.get(f"{split}_files")
+            max_s = getattr(self.dataset_config, f"max_{split}_samples", None)
             return WellH5PairIterableMagLIF(
                 split_dir=meta["split_dirs"][split],
                 stats=self.stats,
@@ -446,6 +459,8 @@ class WellH5SequentialDataProcessorMagLIF(SequentialDataProcessor):
                 cache_samples=getattr(self.dataset_config, "stream_cache_samples", 1),
                 normalization_mode=self.stats.get("normalization_mode", "standard"),
                 sample_ratio=sample_ratio,
+                files_list=files_list,
+                max_samples=max_s,
             )
 
         def make_loader(dataset):

@@ -13,8 +13,9 @@ from ..utils.optimizers import OptimizerArgsConfig
 
 
 def merge_config(default_config_class, user_config):
-    """Merge user configuration with default configuration."""
+    """Merge user configuration with default configuration. Extra keys in user_config are allowed (struct disabled) so that newer config keys work with older codebases."""
     default_config_struct = OmegaConf.structured(default_config_class)
+    OmegaConf.set_struct(default_config_struct, False)
     merged_config = OmegaConf.merge(default_config_struct, user_config)
     return OmegaConf.to_object(merged_config)
 
@@ -61,6 +62,8 @@ class DatasetConfig:
     name: str = "CE-Gauss"                                      # Dataset name
     metaname: str = "compressible_flow/CE-Gauss"                # Dataset metadata identifier
     base_path: str = "/cluster/work/math/camlab-data/rigno-data/unstructured/"  # Base path to dataset
+    split_subdir: str = "data"                                  # Subdir under name for splits (e.g. "data" -> base/name/data/train); "" for base/name/train
+    dataset_key: str = "input_fields"                           # HDF5 key for array (generic_h5)
     backend: str = "netcdf"                                     # "netcdf" | "well"
     train_size: int = 1024                                      # Training set size
     val_size: int = 128                                         # Validation set size
@@ -85,7 +88,8 @@ class DatasetConfig:
     normalization_mode: str = "standard"                        # Normalization mode: ["standard", "log", "quantile"]
     
     # Rollout training and subsampling (for MagLIF pipeline)
-    rollout_steps: int = 0                                      # Number of rollout steps in training loss (0 = disabled, 1-5 recommended)
+    rollout_steps: int = 0                                      # Number of rollout steps in training loss (0 = disabled)
+    max_rollout_lag: int = 100                                  # Max timestep difference initial->final (caps steps: e.g. 5 for step 20)
     rollout_weight_decay: float = 0.8                           # Exponential decay weight for rollout steps (1.0 = equal weight)
     sample_ratio: Optional[float] = None                        # Subsampling ratio for all2all training (None = no subsampling, 0.1-0.2 recommended)
 

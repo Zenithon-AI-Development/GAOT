@@ -326,6 +326,24 @@ DATASET_METADATA = {
     global_mean=[3.4847E+01, 9.4475E-01, 6.1707E-03, -2.4651E-02],
     global_std=[4.4284E+01, 6.0970E-02, 4.1764E-02, 4.0095E-02],
   ),
+  # ---- Hermes blob2d (2D, generic HDF5): t -> t+5 pairs, channelwise zscore ----
+  'benchmarking/blob2d': Metadata(
+    periodic=False,
+    group_u=None,
+    group_c=None,
+    group_x='dimensions',
+    type='gaot',
+    domain_x=([0, 0], [1, 1]),
+    domain_t=None,
+    fix_x=True,
+    active_variables=[0, 1, 2, 3],
+    chunked_variables=[0, 0, 0, 0],
+    num_variable_chunks=1,
+    signed={'u': [False, False, False, False], 'c': None},
+    names={'u': ['ch0', 'ch1', 'ch2', 'ch3'], 'c': None},
+    global_mean=[0.0, 0.0, 0.0, 0.0],
+    global_std=[1.0, 1.0, 1.0, 1.0],
+  ),
   # ---- Shear Flow (2D) ----
   'benchmarking/sf': Metadata(
     periodic=True,   # description: periodic BCs

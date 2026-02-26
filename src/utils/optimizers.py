@@ -452,7 +452,11 @@ class AdamWOptimizer:
                 trainer._train_rel_l1_accum = []
                 trainer._train_rel_l2_accum = []
 
+            max_batches = getattr(trainer.dataset_config, "max_train_batches", None)
+            num_batches_done = 0
             for batch in trainer.train_loader:
+                if max_batches is not None and num_batches_done >= max_batches:
+                    break
                 self.optimizer.zero_grad()
                 train_loss = trainer.train_step(batch)
                 train_loss.backward()
@@ -481,12 +485,14 @@ class AdamWOptimizer:
                 # if (global_step % ckpt_every_steps) == 0:
                 #     trainer.save_ckpt_last(epoch=epoch, extra={"global_step": global_step})
 
+                num_batches_done += 1
 
             if self.scheduler is not None:
                 self.scheduler.step()
 
             # epoch-end eval
-            train_loss = total_loss.cpu().item() / len(trainer.train_loader)
+            n_batches = num_batches_done if num_batches_done > 0 else 1
+            train_loss = total_loss.cpu().item() / n_batches
             
             # For maglif: compute average rel_l1/rel_l2 from accumulated values
             train_rel_l1 = None

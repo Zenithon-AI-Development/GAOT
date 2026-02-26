@@ -13,7 +13,7 @@ import time
 
 from .default_configs import SetUpConfig, ModelConfig, DatasetConfig, OptimizerConfig, PathConfig, merge_config
 from .trainer_utils import manual_seed, load_ckpt, save_ckpt
-from ..datasets.dataset import DATASET_METADATA
+from ..datasets.dataset import DATASET_METADATA, Metadata
 from ..utils.optimizers import AdamOptimizer, AdamWOptimizer
 
 
@@ -46,8 +46,19 @@ class BaseTrainer(ABC):
         self.optimizer_config = merge_config(OptimizerConfig, config.optimizer)
         self.path_config = merge_config(PathConfig, config.path)
         
-        # Load dataset metadata
-        self.metadata = DATASET_METADATA[self.dataset_config.metaname]
+        # Load dataset metadata (fallback for generic_h5 when metaname not in DATASET_METADATA; sequential_trainer overwrites active_variables etc from processor)
+        if self.dataset_config.metaname in DATASET_METADATA:
+            self.metadata = DATASET_METADATA[self.dataset_config.metaname]
+        elif getattr(self.dataset_config, "backend", None) == "generic_h5":
+            self.metadata = Metadata(
+                periodic=False, group_u=None, group_c=None, group_x="dimensions", type="gaot",
+                domain_x=([0, 0], [1, 1]), domain_t=(0, 1), fix_x=True,
+                active_variables=[0], chunked_variables=[0], num_variable_chunks=1,
+                signed={"u": [False], "c": None}, names={"u": ["ch0"], "c": None},
+                global_mean=[0.0], global_std=[1.0],
+            )
+        else:
+            raise KeyError(f"Dataset metaname '{self.dataset_config.metaname}' not in DATASET_METADATA and no generic_h5 fallback.")
         
         # Initialize distributed training if specified
         if self.setup_config.distributed:
@@ -324,12 +335,23 @@ class BaseTrainer(ABC):
     def save_ckpt_best(self, epoch: int, best_loss: float, extra: dict | None = None):
         os.makedirs(os.path.dirname(self.path_config.ckpt_path), exist_ok=True)
         from .trainer_utils import save_ckpt
+        best_path = self._ckpt_path("best")
         save_ckpt(
-            self._ckpt_path("best"),
+            best_path,
             model=self.model,
             # optimizer=getattr(self.optimizer, "optimizer", None),
             # extra={"epoch": epoch, "best_loss": float(best_loss), **(extra or {})}
         )
+        # Sync best checkpoint to GCS when GAOT_CHECKPOINTS_DIR is set (e.g. Skypilot runs)
+        gcs_ckpt_dir = os.environ.get("GAOT_CHECKPOINTS_DIR")
+        if gcs_ckpt_dir:
+            import shutil
+            dest = os.path.join(gcs_ckpt_dir, os.path.basename(best_path))
+            try:
+                shutil.copy2(best_path, dest)
+                print(f"[CHECKPOINT] Synced best to GCS: {dest}")
+            except Exception as e:
+                print(f"[CHECKPOINT] WARNING: could not sync best to GCS: {e}")
 
     def save_ckpt_last(self, epoch: int | None = None, extra: dict | None = None):
         os.makedirs(os.path.dirname(self.path_config.ckpt_path), exist_ok=True)
