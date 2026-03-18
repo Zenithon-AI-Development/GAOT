@@ -11,6 +11,11 @@ resources:
   accelerators: T4:1
   use_spot: false
   region: us-central1
+  labels:
+    project: fluid
+    type: model_training
+    team: ml
+    name: david
 
 num_nodes: 1
 

@@ -226,6 +226,35 @@ class BaseTrainer(ABC):
         self.config.datarow['training time'] = result['time']
         
         self.save_ckpt()
+        # Final sync of best checkpoint to GCS so it is available after run/cluster stops
+        best_path = self._ckpt_path("best")
+        if os.path.isfile(best_path):
+            gcs_ckpt_dir = os.environ.get("GAOT_CHECKPOINTS_DIR")
+            if gcs_ckpt_dir:
+                try:
+                    import shutil
+                    dest = os.path.join(gcs_ckpt_dir, os.path.basename(best_path))
+                    shutil.copy2(best_path, dest)
+                    print(f"[CHECKPOINT] Final sync best to GCS: {dest}")
+                except Exception as e:
+                    print(f"[CHECKPOINT] WARNING: final sync to GCS failed: {e}")
+            gcs_uri = os.environ.get("GAOT_CHECKPOINTS_GCS_URI")
+            if gcs_uri:
+                try:
+                    import subprocess
+                    subprocess.run(
+                        ["gsutil", "-m", "cp", best_path, gcs_uri],
+                        check=True,
+                        timeout=300,
+                        capture_output=True,
+                        text=True,
+                    )
+                    print(f"[CHECKPOINT] Final upload to GCS: {gcs_uri}")
+                except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+                    err_msg = getattr(e, "stderr", None) or getattr(e, "output", None)
+                    if err_msg and getattr(err_msg, "strip", None):
+                        err_msg = err_msg.strip()
+                    print(f"[CHECKPOINT] WARNING: final gsutil cp failed: {e}" + (f" stderr: {err_msg}" if err_msg else ""))
 
         if len(result['train']['loss']) == 0:
             ### time measurement for inference
@@ -342,7 +371,7 @@ class BaseTrainer(ABC):
             # optimizer=getattr(self.optimizer, "optimizer", None),
             # extra={"epoch": epoch, "best_loss": float(best_loss), **(extra or {})}
         )
-        # Sync best checkpoint to GCS when GAOT_CHECKPOINTS_DIR is set (e.g. Skypilot runs)
+        # Sync best checkpoint: (1) to mount dir if set; (2) explicit gsutil to GCS URI so it is visible in bucket
         gcs_ckpt_dir = os.environ.get("GAOT_CHECKPOINTS_DIR")
         if gcs_ckpt_dir:
             import shutil
@@ -352,6 +381,23 @@ class BaseTrainer(ABC):
                 print(f"[CHECKPOINT] Synced best to GCS: {dest}")
             except Exception as e:
                 print(f"[CHECKPOINT] WARNING: could not sync best to GCS: {e}")
+        gcs_uri = os.environ.get("GAOT_CHECKPOINTS_GCS_URI")
+        if gcs_uri:
+            import subprocess
+            try:
+                r = subprocess.run(
+                    ["gsutil", "-m", "cp", best_path, gcs_uri],
+                    check=True,
+                    timeout=300,
+                    capture_output=True,
+                    text=True,
+                )
+                print(f"[CHECKPOINT] Uploaded to GCS: {gcs_uri}")
+            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+                err_msg = getattr(e, "stderr", None) or getattr(e, "output", None)
+                if err_msg and getattr(err_msg, "strip", None):
+                    err_msg = err_msg.strip()
+                print(f"[CHECKPOINT] WARNING: gsutil cp failed: {e}" + (f" stderr: {err_msg}" if err_msg else ""))
 
     def save_ckpt_last(self, epoch: int | None = None, extra: dict | None = None):
         os.makedirs(os.path.dirname(self.path_config.ckpt_path), exist_ok=True)

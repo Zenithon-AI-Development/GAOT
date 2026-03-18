@@ -52,12 +52,17 @@ def setup_wandb(arg):
     # )
     # run.config.update({"epoch": 110}, allow_val_change=True)
 
+    # If online but no API key, fall back to offline so the run does not crash (sync later with wandb sync)
+    mode = wb.get("mode", "online")
+    if mode == "online" and not (os.environ.get("WANDB_API_KEY") or "").strip():
+        mode = "offline"
+        print("[WandB] WANDB_API_KEY not set; using mode=offline. Pass --env WANDB_API_KEY=... when launching for online logging.")
     run = wandb.init(
         project=wb.get("project", "gaot"),
         entity=wb.get("entity"),
         group=wb.get("group"),
         job_type=wb.get("job_type", "train"),
-        mode=wb.get("mode", "online"),       # "online" | "offline" | "disabled"
+        mode=mode,
         dir=wb.get("dir", "./wandb"),
         tags=wb.get("tags", []),
         notes=wb.get("notes", ""),
@@ -184,8 +189,8 @@ def run_arg(arg):
         wandb.watch(
             t.model,
             log=wb.get("watch_log", "all"),
-            log_freq=int(wb.get("watch_freq", 100) or 100)
-    )
+            log_freq=int(wb.get("watch_freq", 100) or 100),
+        )
         wandb_run.log({"status/started": 1, "model/params": sum(p.numel() for p in t.model.parameters())}, step=0)
 
 
