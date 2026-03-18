@@ -1,0 +1,67 @@
+# Reusable smoke cluster: first time use sky launch ... -c sky-smoke-maglif -y (runs setup).
+# For iterative bug fixes re-run with --no-setup so only the run section runs (no setup wait):
+#   sky launch maglif_smoke_skypilot.yaml -c sky-smoke-maglif --no-setup -y
+name: maglif-smoke
+
+file_mounts:
+  /home/shared_info/new_processed_maglif: gs://data-share-bucket-zenithon/new_processed_maglif
+  /tmp/gcs_checkpoints: gs://zen_ml_checkpoints
+  /tmp/gcs_logs: gs://zen_ml_logs
+  /tmp/gcs_data: gs://zen_ml_data
+
+resources:
+  cpus: 4
+  accelerators: T4:1
+  use_spot: true
+  region: us-central1
+  disk_size: 400
+  labels:
+    project: fluid
+    type: model_training
+    team: ml
+    name: david
+
+num_nodes: 1
+
+setup: |
+  git clone -b development https://github.com/Zenithon-AI-Development/GAOT.git /tmp/gaot
+  cd /tmp/gaot
+  if ! conda env list | grep -q gaot_env; then
+    conda create -n gaot_env python=3.10 -y
+  fi
+  conda activate gaot_env
+  pip install -q toml wandb omegaconf xarray rotary-embedding-torch numpy torch matplotlib tqdm scipy h5py
+  python -c "import torch; v=torch.__version__; c=torch.version.cuda or 'cpu'; print(f'torch-{v.split(\"+\")[0]}+{c}')" > /tmp/torch_ver.txt
+  TORCH_VER=$(cat /tmp/torch_ver.txt)
+  pip install torch-scatter -f https://data.pyg.org/whl/${TORCH_VER}.html || pip install torch-scatter --no-build-isolation
+
+run: |
+  set -e
+  source $(conda info --base)/etc/profile.d/conda.sh
+  if [ ! -d /tmp/gaot ]; then
+    git clone -b development https://github.com/Zenithon-AI-Development/GAOT.git /tmp/gaot
+  fi
+  cd /tmp/gaot
+  if ! conda env list | grep -q gaot_env; then
+    conda create -n gaot_env python=3.10 -y
+    conda activate gaot_env
+    pip install -q toml wandb omegaconf xarray rotary-embedding-torch numpy torch matplotlib tqdm scipy h5py
+    python -c "import torch; v=torch.__version__; c=torch.version.cuda or 'cpu'; print(f'torch-{v.split(\"+\")[0]}+{c}')" > /tmp/torch_ver.txt
+    TORCH_VER=$(cat /tmp/torch_ver.txt)
+    pip install torch-scatter -f https://data.pyg.org/whl/${TORCH_VER}.html || pip install torch-scatter --no-build-isolation
+  else
+    conda activate gaot_env
+  fi
+  cd /tmp/gaot && git pull origin development || true
+  python -c "import pathlib; p=pathlib.Path('/tmp/gaot/src/core/default_configs.py'); s=p.read_text(); s=s.replace('    merged_config = OmegaConf.merge(default_config_struct, user_config)','    OmegaConf.set_struct(default_config_struct, False)\n    merged_config = OmegaConf.merge(default_config_struct, user_config)') if 'set_struct' not in s else s; p.write_text(s)"
+  mkdir -p /tmp/gaot/scripts
+  echo 'IiIiQXBwbHkgbWF4X3RyYWluX2JhdGNoZXMgbG9naWMgdG8gb3B0aW1pemVycy5weSBpbi1wbGFjZSB3aGVuIHJ1biBmcm9tIHJlcG8gcm9vdC4gSWRlbXBvdGVudC4iIiIKaW1wb3J0IHBhdGhsaWIKCnBhdGggPSBwYXRobGliLlBhdGgoInNyYy91dGlscy9vcHRpbWl6ZXJzLnB5IikKcyA9IHBhdGgucmVhZF90ZXh0KCkKbGluZXMgPSBzLnNwbGl0bGluZXMoa2VlcGVuZHM9VHJ1ZSkKCmlkeF9mb3IgPSBuZXh0KAogICAgKGkgZm9yIGksIGwgaW4gZW51bWVyYXRlKGxpbmVzKSBpZiAiZm9yIGJhdGNoIGluIHRyYWluZXIudHJhaW5fbG9hZGVyOiIgaW4gbCBhbmQgbm90IGwubHN0cmlwKCkuc3RhcnRzd2l0aCgiIyIpKSwKICAgIE5vbmUsCikKaWYgaWR4X2ZvciBpcyBOb25lIG9yIGlkeF9mb3IgKyAxID49IGxlbihsaW5lcyk6CiAgICBleGl0KDEpCgojIFJldmVydCBhbnkgZXhpc3RpbmcgcGF0Y2ggYmxvY2sgc28gd2UgY2FuIGFwcGx5IGNsZWFubHkgKHJlbW92ZXMgbWF4X2JhdGNoZXMsIG51bV9iYXRjaGVzX2RvbmUsIGlmL2JyZWFrKS4KaWYgaWR4X2ZvciA+PSAyIGFuZCBpZHhfZm9yICsgMiA8IGxlbihsaW5lcyk6CiAgICBpZiAibWF4X2JhdGNoZXMgPSBnZXRhdHRyIiBpbiBsaW5lc1tpZHhfZm9yIC0gMl0gYW5kICJudW1fYmF0Y2hlc19kb25lID0gMCIgaW4gbGluZXNbaWR4X2ZvciAtIDFdOgogICAgICAgIGlmICJpZiBtYXhfYmF0Y2hlcyBpcyBub3QgTm9uZSIgaW4gbGluZXNbaWR4X2ZvciArIDFdIGFuZCAiYnJlYWsiIGluIGxpbmVzW2lkeF9mb3IgKyAyXToKICAgICAgICAgICAgbGluZXMgPSBsaW5lc1s6IGlkeF9mb3IgLSAyXSArIFtsaW5lc1tpZHhfZm9yXSwgbGluZXNbaWR4X2ZvciArIDNdXSArIGxpbmVzW2lkeF9mb3IgKyA0IDpdCiAgICAgICAgICAgIHMgPSAiIi5qb2luKGxpbmVzKQogICAgICAgICAgICBsaW5lcyA9IHMuc3BsaXRsaW5lcyhrZWVwZW5kcz1UcnVlKQogICAgICAgICAgICBpZHhfZm9yID0gbmV4dCgKICAgICAgICAgICAgICAgIChpIGZvciBpLCBsIGluIGVudW1lcmF0ZShsaW5lcykgaWYgImZvciBiYXRjaCBpbiB0cmFpbmVyLnRyYWluX2xvYWRlcjoiIGluIGwgYW5kIG5vdCBsLmxzdHJpcCgpLnN0YXJ0c3dpdGgoIiMiKSksCiAgICAgICAgICAgICAgICBOb25lLAogICAgICAgICAgICApCiAgICAgICAgICAgIGlmIGlkeF9mb3IgaXMgTm9uZSBvciBpZHhfZm9yICsgMSA+PSBsZW4obGluZXMpOgogICAgICAgICAgICAgICAgZXhpdCgxKQoKIyBGaXggY29ycnVwdGVkIGNvbW1lbnQgYmxvY2sgaWYgcHJlc2VudCAod3JvbmdseSB1bmNvbW1lbnRlZCBuX2JhdGNoZXMvdHJhaW5fbG9zcyBpbiBjb21tZW50IHNlY3Rpb24pLgpmb3IgaSBpbiByYW5nZSgxLCBsZW4obGluZXMpKToKICAgIGlmICJ0cmFpbl9sb3NzID0gdG90YWxfbG9zcy5jcHUoKS5pdGVtKCkgLyBuX2JhdGNoZXMiIG5vdCBpbiBsaW5lc1tpXSBvciBsaW5lc1tpXS5sc3RyaXAoKS5zdGFydHN3aXRoKCIjIik6CiAgICAgICAgY29udGludWUKICAgIGlmICJuX2JhdGNoZXMgPSBudW1fYmF0Y2hlc19kb25lIiBub3QgaW4gbGluZXNbaSAtIDFdOgogICAgICAgIGNvbnRpbnVlCiAgICBpZiBpIDwgMiBvciBub3QgbGluZXNbaSAtIDJdLnN0cmlwKCkuc3RhcnRzd2l0aCgiIyIpIG9yIG5vdCBsaW5lc1tpIC0gMl0uc3RhcnRzd2l0aCgiICAgICMiKToKICAgICAgICBjb250aW51ZQogICAgbGluZXNbaSAtIDFdID0gIiAgICAjICAgICAgICAgICAgIHRyYWluX2xvc3MgPSB0b3RhbF9sb3NzLmNwdSgpLml0ZW0oKSAvIGxlbih0cmFpbmVyLnRyYWluX2xvYWRlcilcbiIKICAgIGRlbCBsaW5lc1tpXQogICAgcyA9ICIiLmpvaW4obGluZXMpCiAgICBsaW5lcyA9IHMuc3BsaXRsaW5lcyhrZWVwZW5kcz1UcnVlKQogICAgYnJlYWsKCmlkeCA9IGlkeF9mb3IKCiMgVXNlIGV4YWN0IGxlYWRpbmcgd2hpdGVzcGFjZSBmcm9tIHRoZSBmaWxlIChwcmVzZXJ2ZXMgdGFicyB2cyBzcGFjZXMpLgpsZWFkaW5nID0gbGluZXNbaWR4XVs6IGxlbihsaW5lc1tpZHhdKSAtIGxlbihsaW5lc1tpZHhdLmxzdHJpcCgpKV0KcGFkID0gbGVhZGluZwppbm5lciA9IGxlYWRpbmcgKyAoIlx0IiBpZiAiXHQiIGluIGxlYWRpbmcgZWxzZSAiICAgICIpCm5ld19ibG9jayA9IFsKICAgIHBhZCArICJtYXhfYmF0Y2hlcyA9IGdldGF0dHIodHJhaW5lci5kYXRhc2V0X2NvbmZpZywgXCJtYXhfdHJhaW5fYmF0Y2hlc1wiLCBOb25lKVxuIiwKICAgIHBhZCArICJudW1fYmF0Y2hlc19kb25lID0gMFxuIiwKICAgIGxpbmVzW2lkeF0sCiAgICBpbm5lciArICJpZiBtYXhfYmF0Y2hlcyBpcyBub3QgTm9uZSBhbmQgbnVtX2JhdGNoZXNfZG9uZSA+PSBtYXhfYmF0Y2hlczpcbiIsCiAgICBpbm5lciArICIgICAgYnJlYWtcbiIsCiAgICBpbm5lciArICJzZWxmLm9wdGltaXplci56ZXJvX2dyYWQoKVxuIiwKXQpzID0gIiIuam9pbihsaW5lc1s6aWR4XSArIG5ld19ibG9jayArIGxpbmVzW2lkeCArIDIgOl0pCgpvbGQgPSAiICAgICAgICAgICAgICAgICMgaWYgKGdsb2JhbF9zdGVwICUgY2twdF9ldmVyeV9zdGVwcykgPT0gMDpcbiAgICAgICAgICAgICAgICAjICAgICB0cmFpbmVyLnNhdmVfY2twdF9sYXN0KGVwb2NoPWVwb2NoLCBleHRyYT17XCJnbG9iYWxfc3RlcFwiOiBnbG9iYWxfc3RlcH0pXG5cblxuICAgICAgICAgICAgaWYgc2VsZi5zY2hlZHVsZXIiCm5ldyA9ICIgICAgICAgICAgICAgICAgIyBpZiAoZ2xvYmFsX3N0ZXAgJSBja3B0X2V2ZXJ5X3N0ZXBzKSA9PSAwOlxuICAgICAgICAgICAgICAgICMgICAgIHRyYWluZXIuc2F2ZV9ja3B0X2xhc3QoZXBvY2g9ZXBvY2gsIGV4dHJhPXtcImdsb2JhbF9zdGVwXCI6IGdsb2JhbF9zdGVwfSlcblxuICAgICAgICAgICAgICAgIG51bV9iYXRjaGVzX2RvbmUgKz0gMVxuXG4gICAgICAgICAgICBpZiBzZWxmLnNjaGVkdWxlciIKcyA9IHMucmVwbGFjZShvbGQsIG5ldykKCiMgUmVwbGFjZSB0cmFpbl9sb3NzIGxpbmUgb25seSBpbiBhY3RpdmUgY29kZSAoc2tpcCBjb21tZW50IGxpbmVzKS4KbGluZXNfb3V0ID0gcy5zcGxpdGxpbmVzKGtlZXBlbmRzPVRydWUpCmZvciBpLCBsaW5lIGluIGVudW1lcmF0ZShsaW5lc19vdXQpOgogICAgaWYgInRyYWluX2xvc3MgPSB0b3RhbF9sb3NzLmNwdSgpLml0ZW0oKSAvIGxlbih0cmFpbmVyLnRyYWluX2xvYWRlcikiIG5vdCBpbiBsaW5lIG9yIGxpbmUubHN0cmlwKCkuc3RhcnRzd2l0aCgiIyIpOgogICAgICAgIGNvbnRpbnVlCiAgICBpbmRlbnQgPSBsaW5lWzogbGVuKGxpbmUpIC0gbGVuKGxpbmUubHN0cmlwKCkpXQogICAgbGluZXNfb3V0W2ldID0gaW5kZW50ICsgIm5fYmF0Y2hlcyA9IG51bV9iYXRjaGVzX2RvbmUgaWYgbnVtX2JhdGNoZXNfZG9uZSA+IDAgZWxzZSAxXG4iICsgaW5kZW50ICsgInRyYWluX2xvc3MgPSB0b3RhbF9sb3NzLmNwdSgpLml0ZW0oKSAvIG5fYmF0Y2hlc1xuIgogICAgYnJlYWsKcyA9ICIiLmpvaW4obGluZXNfb3V0KQpwYXRoLndyaXRlX3RleHQocykK' | base64 -d > /tmp/gaot/scripts/patch_optimizers_max_batches.py
+  (cd /tmp/gaot && python scripts/patch_optimizers_max_batches.py) || true
+  mkdir -p /tmp/gaot/config/examples/time_dep
+  printf '%s\n' '{"setup":{"seed":42,"device":"cuda:0","dtype":"torch.float32","trainer_name":"sequential","train":true,"test":false,"ckpt":false},"model":{"name":"gaot","latent_tokens_size":[64],"use_conditional_norm":false,"args":{"magno":{"coord_dim":1,"scales":[1],"use_scale_weights":true,"radius":0.1,"hidden_size":16,"mlp_layers":1,"lifting_channels":16},"transformer":{"patch_size":2,"hidden_size":32}}},"dataset":{"backend":"well_maglif","name":"new_processed_maglif","metaname":"benchmarking/maglif","base_path":"/home/shared_info/","use_metadata_stats":false,"use_sparse":false,"train_size":-1,"val_size":-1,"test_size":-1,"max_time_diff":20,"time_step":4,"coord_scaling":"global_scaling","batch_size":2,"num_workers":0,"shuffle":true,"metric":"final_step","predict_mode":"all","stepper_mode":"output","normalization_mode":"log","sample_ratio":1.0,"rollout_steps":2,"max_rollout_lag":100,"rollout_weight_decay":0.75,"max_train_files":1,"max_val_files":1,"max_test_files":1,"max_train_samples":2,"max_val_samples":2,"max_test_samples":2,"max_train_batches":1},"optimizer":{"name":"adamw","args":{"lr":0.0008,"weight_decay":0.00001,"epoch":1,"loss_scale":1,"eval_every_eps":1,"scheduler":"mix","max_lr":0.001,"min_lr":0.0001,"final_lr":0.00005}},"path":{"ckpt_path":".ckpt/examples/time_dep/maglif_smoke.pt","loss_path":".loss/examples/time_dep/maglif_smoke.png","result_path":".results/examples/time_dep/maglif_smoke.png","database_path":".database/examples/time_dep/maglif_smoke.csv"},"wandb":{"enabled":false,"project":"gaot-maglif","entity":"Zenithon-AI","group":"maglif-smoke","run_name":"GAOT_maglif_smoke","mode":"offline","tags":["GAOT","maglif","smoke"],"watch_log":"all","watch_freq":10,"log_interval":5,"save_code":true}}' > /tmp/gaot/config/examples/time_dep/maglif_smoke.json
+  mkdir -p /tmp/gaot/.loss/examples/time_dep /tmp/gaot/.results/examples/time_dep /tmp/gaot/.ckpt/examples/time_dep /tmp/gaot/.database/examples/time_dep
+  export GAOT_CHECKPOINTS_DIR=/tmp/gcs_checkpoints/gaot_maglif_smoke
+  export GAOT_LOGS_DIR=/tmp/gcs_logs/gaot_maglif_smoke
+  export GAOT_DATA_DIR=/tmp/gcs_data/gaot_maglif_smoke
+  mkdir -p ${GAOT_CHECKPOINTS_DIR} ${GAOT_LOGS_DIR} ${GAOT_DATA_DIR}
+  python main.py --config config/examples/time_dep/maglif_smoke.json

@@ -1272,8 +1272,8 @@ class SequentialTrainer(BaseTrainer):
         u_full, c_full, t_vals = self._load_full_trajectory_from_h5(file_path)  # [T,N,Cu], [T,N,Cc] or None, [T]
         T, N, Cu = u_full.shape
         
-        # Get time step (lag) from config
-        lag = int(self.time_step) if self.time_step is not None else 4
+        # Use max_time_diff as the lag for visualization (largest trained step size)
+        lag = int(self.max_time_diff) if self.max_time_diff is not None else (int(self.time_step) if self.time_step is not None else 4)
         
         # print(f"[TRAJECTORY] Creating predictions using pair-based approach (lag={lag})")
         # print(f"  Snapshots 0-{lag-1}: Ground truth")
@@ -2122,7 +2122,8 @@ class SequentialTrainer(BaseTrainer):
             if batch_times and total_samples > 0:
                 mean_time = np.mean(batch_times)
                 std_time = np.std(batch_times)
-                avg_batch_size = (total_samples - est_first_batch_size) / max(1, len(batch_times)) if first_batch_time is not None else total_samples / len(batch_times)
+                est_first = (total_samples / max(1, total_batches)) if first_batch_time is not None else 0
+                avg_batch_size = (total_samples - est_first) / max(1, len(batch_times)) if first_batch_time is not None else total_samples / len(batch_times)
                 ms_per_traj_mean = (mean_time * 1000.0) / max(1, avg_batch_size)
                 print(f"[Timing] Subsequent batches: {mean_time*1000:.2f} ± {std_time*1000:.2f} ms total (mean ± std)")
                 print(f"[Timing]                     {ms_per_traj_mean:.2f} ms/trajectory (averaged)")
@@ -2315,7 +2316,7 @@ class SequentialTrainer(BaseTrainer):
             # Animation 1: Standard (current behavior)
             animation_path_1 = base_animation_path.replace('.gif', '_standard.gif')
             if self.coord_dim == 1:
-                max_frames = 300
+                max_frames = 10000  # No downsampling — step size controls density
                 create_sequential_animation_1d(
                     gt_sequence=gt_sequence,
                     pred_sequence=pred_sequence,
@@ -2353,11 +2354,10 @@ class SequentialTrainer(BaseTrainer):
             print(f"Standard animation saved to {animation_path_1}")
             
             # Animation 2: Fully autoregressive from initial state only
-            # Use step=3 to match training timesteps (training uses lags 3, 12, 20)
-            # Animation subsampling will handle visualization smoothness
+            # Use max_time_diff as the step (largest trained step size, no further subsampling)
+            anim_step = int(self.max_time_diff) if self.max_time_diff is not None else (int(self.time_step) if self.time_step is not None else 4)
             max_available = len(t_vals_np) - 1  # Maximum available timesteps in trajectory
-            max_anim_steps = min(max_available, 100)  # Limit to avoid memory issues and stay within trajectory
-            animation_time_indices = np.arange(0, max_anim_steps + 1, 3, dtype=int)  # Step=3 to match training
+            animation_time_indices = np.arange(0, max_available + 1, anim_step, dtype=int)
             
             # Extract initial state from input_data (denormalized u from first sample)
             u_dim = self.stats["u"]["mean"].shape[-1]
@@ -2432,7 +2432,7 @@ class SequentialTrainer(BaseTrainer):
             # Animation 2: Fully autoregressive
             animation_path_2 = base_animation_path.replace('.gif', '_autoregressive.gif')
             if self.coord_dim == 1:
-                max_frames = 300
+                max_frames = 10000  # No downsampling — step size controls density
                 create_sequential_animation_1d(
                     gt_sequence=gt_sequence,
                     pred_sequence=pred_sequence_autoreg,

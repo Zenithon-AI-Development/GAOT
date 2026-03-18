@@ -1,0 +1,94 @@
+{
+    "setup": {
+        "seed": 42,
+        "device": "cuda:0",
+        "dtype": "torch.float32",
+        "trainer_name": "sequential",
+        "train": true,
+        "test": false,
+        "ckpt": false
+    },
+
+    "model": {
+        "name": "gaot",
+        "latent_tokens_size": [64],
+        "use_conditional_norm": false,
+        "args": {
+            "magno": {
+                "coord_dim": 1,
+                "scales": [1],
+                "use_scale_weights": true,
+                "radius": 0.1,
+                "hidden_size": 64,
+                "mlp_layers": 3,
+                "lifting_channels": 64
+            },
+            "transformer": {
+                "patch_size": 2,
+                "hidden_size": 256
+            }
+        }
+    },
+
+    "dataset": {
+        "backend": "well_maglif",
+        "name": "new_processed_maglif",
+        "metaname": "benchmarking/maglif",
+        "base_path": "/home/shared_info/",
+        "use_metadata_stats": false,
+        "use_sparse": false,
+        "train_size": -1,
+        "val_size": -1,
+        "test_size": -1,
+        "max_time_diff": 20,
+        "time_step": 4,
+        "coord_scaling": "global_scaling",
+        "batch_size": 8,
+        "num_workers": 0,
+        "shuffle": true,
+        "metric": "final_step",
+        "predict_mode": "all",
+        "stepper_mode": "output",
+        "normalization_mode": "log",
+        "sample_ratio": 0.05,
+        "rollout_steps": 10,
+        "max_rollout_lag": 100,
+        "rollout_weight_decay": 0.75
+    },
+
+    "optimizer": {
+        "name": "adamw",
+        "args": {
+            "lr": 8e-4,
+            "weight_decay": 1e-05,
+            "epoch": 5,
+            "loss_scale": 1.0,
+            "eval_every_eps": 2,
+            "scheduler": "mix",
+            "max_lr": 1e-3,
+            "min_lr": 1e-4,
+            "final_lr": 5e-5
+        }
+    },
+
+    "path": {
+        "ckpt_path": ".ckpt/examples/time_dep/maglif_long_rollout_test.pt",
+        "loss_path": ".loss/examples/time_dep/maglif_long_rollout_test.png",
+        "result_path": ".results/examples/time_dep/maglif_long_rollout_test.png",
+        "database_path": ".database/examples/time_dep/maglif_long_rollout_test.csv"
+    },
+
+    "wandb": {
+        "enabled": false,
+        "project": "gaot-maglif",
+        "entity": "Zenithon-AI",
+        "group": "maglif-long-rollout-test",
+        "run_name": "GAOT_maglif_long_rollout_test",
+        "mode": "offline",
+        "tags": ["GAOT", "maglif", "long-rollout", "test"],
+        "watch_log": "all",
+        "watch_freq": 10,
+        "log_interval": 5,
+        "save_code": true
+    }
+}

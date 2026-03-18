@@ -1,0 +1,74 @@
+# Full training. Launch with WandB: sky jobs launch maglif_long_rollout_skypilot.yaml -n maglif-long-rollout -y --env 'WANDB_API_KEY=<your_40+_char_key>'
+# Rerun with bigger GPU: add --gpus L4:1 (or change accelerators below to L4:1)
+name: maglif-long-rollout
+
+file_mounts:
+  /home/shared_info/new_processed_maglif: gs://data-share-bucket-zenithon/new_processed_maglif
+  /tmp/gcs_checkpoints: gs://zen_ml_checkpoints
+  /tmp/gcs_logs: gs://zen_ml_logs
+  /tmp/gcs_data: gs://zen_ml_data
+
+resources:
+  cpus: 4
+  accelerators: T4:1
+  use_spot: true
+  disk_size: 400
+  labels:
+    project: fluid
+    type: model_training
+    team: ml
+    name: david
+
+num_nodes: 1
+
+setup: |
+  git clone -b development https://github.com/Zenithon-AI-Development/GAOT.git /tmp/gaot
+  cd /tmp/gaot
+  if ! conda env list | grep -q gaot_env; then
+    conda create -n gaot_env python=3.10 -y
+  fi
+  conda activate gaot_env
+  pip install -q toml wandb omegaconf xarray rotary-embedding-torch numpy torch matplotlib tqdm scipy h5py
+  python -c "import torch; v=torch.__version__; c=torch.version.cuda or 'cpu'; print(f'torch-{v.split(\"+\")[0]}+{c}')" > /tmp/torch_ver.txt
+  TORCH_VER=$(cat /tmp/torch_ver.txt)
+  pip install torch-scatter -f https://data.pyg.org/whl/${TORCH_VER}.html || pip install torch-scatter --no-build-isolation
+
+run: |
+  set -e
+  source $(conda info --base)/etc/profile.d/conda.sh
+  if [ ! -d /tmp/gaot ]; then
+    git clone -b development https://github.com/Zenithon-AI-Development/GAOT.git /tmp/gaot
+  fi
+  cd /tmp/gaot
+  if ! conda env list | grep -q gaot_env; then
+    conda create -n gaot_env python=3.10 -y
+    conda activate gaot_env
+    pip install -q toml wandb omegaconf xarray rotary-embedding-torch numpy torch matplotlib tqdm scipy h5py
+    python -c "import torch; v=torch.__version__; c=torch.version.cuda or 'cpu'; print(f'torch-{v.split(\"+\")[0]}+{c}')" > /tmp/torch_ver.txt
+    TORCH_VER=$(cat /tmp/torch_ver.txt)
+    pip install torch-scatter -f https://data.pyg.org/whl/${TORCH_VER}.html || pip install torch-scatter --no-build-isolation
+  else
+    conda activate gaot_env
+  fi
+  cd /tmp/gaot && git pull origin development || true
+  python -c "import pathlib; p=pathlib.Path('/tmp/gaot/src/core/default_configs.py'); s=p.read_text(); s=s.replace('    merged_config = OmegaConf.merge(default_config_struct, user_config)','    OmegaConf.set_struct(default_config_struct, False)\n    merged_config = OmegaConf.merge(default_config_struct, user_config)') if 'set_struct' not in s else s; p.write_text(s)"
+  mkdir -p /tmp/gaot/config/examples/time_dep
+  [ -z "${WANDB_API_KEY}" ] && echo "WARNING: WANDB_API_KEY not set; wandb will use offline mode. Launch with: --env 'WANDB_API_KEY=<your_key>'"
+  printf '%s\n' '{"setup":{"seed":42,"device":"cuda:0","dtype":"torch.float32","trainer_name":"sequential","train":true,"test":false,"ckpt":false},"model":{"name":"gaot","latent_tokens_size":[64],"use_conditional_norm":false,"args":{"magno":{"coord_dim":1,"scales":[1],"use_scale_weights":true,"radius":0.1,"hidden_size":64,"mlp_layers":3,"lifting_channels":64},"transformer":{"patch_size":2,"hidden_size":256}}},"dataset":{"backend":"well_maglif","name":"new_processed_maglif","metaname":"benchmarking/maglif","base_path":"/home/shared_info/","use_metadata_stats":false,"use_sparse":false,"train_size":-1,"val_size":-1,"test_size":-1,"max_time_diff":20,"time_step":4,"coord_scaling":"global_scaling","batch_size":16,"num_workers":0,"shuffle":true,"metric":"final_step","predict_mode":"all","stepper_mode":"output","normalization_mode":"log","sample_ratio":0.15,"rollout_steps":100,"max_rollout_lag":100,"rollout_weight_decay":0.75},"optimizer":{"name":"adamw","args":{"lr":0.0008,"weight_decay":0.00001,"epoch":1000,"loss_scale":1,"eval_every_eps":5,"scheduler":"mix","max_lr":0.001,"min_lr":0.0001,"final_lr":0.00005}},"path":{"ckpt_path":".ckpt/examples/time_dep/maglif_long_rollout.pt","loss_path":".loss/examples/time_dep/maglif_long_rollout.png","result_path":".results/examples/time_dep/maglif_long_rollout.png","database_path":".database/examples/time_dep/maglif_long_rollout.csv"},"wandb":{"enabled":true,"project":"gaot-maglif","entity":"Zenithon-AI","group":"maglif-long-rollout","run_name":"GAOT_maglif_long_rollout","mode":"online","tags":["GAOT","maglif","long-rollout"],"watch_log":"all","watch_freq":10,"log_interval":5,"save_code":true}}' > /tmp/gaot/config/examples/time_dep/maglif_long_rollout.json
+  mkdir -p /tmp/gaot/.loss/examples/time_dep /tmp/gaot/.results/examples/time_dep /tmp/gaot/.ckpt/examples/time_dep /tmp/gaot/.database/examples/time_dep
+  export WANDB_API_KEY=${WANDB_API_KEY}
+  export GAOT_CHECKPOINTS_DIR=/tmp/gcs_checkpoints/gaot_maglif_long_rollout
+  export GAOT_CHECKPOINTS_GCS_URI=gs://zen_ml_checkpoints/gaot_maglif_long_rollout/maglif_long_rollout.best.pt
+  export GAOT_LOGS_DIR=/tmp/gcs_logs/gaot_maglif_long_rollout
+  export GAOT_DATA_DIR=/tmp/gcs_data/gaot_maglif_long_rollout
+  mkdir -p ${GAOT_CHECKPOINTS_DIR} ${GAOT_LOGS_DIR} ${GAOT_DATA_DIR}
+  BEST_PT="/tmp/gaot/.ckpt/examples/time_dep/maglif_long_rollout.best.pt"
+  GCS_CKPT_URI="gs://zen_ml_checkpoints/gaot_maglif_long_rollout/maglif_long_rollout.best.pt"
+  sync_ckpt() { if [ -f "$BEST_PT" ]; then gsutil -m cp "$BEST_PT" "$GCS_CKPT_URI" && echo "Checkpoint synced to GCS (exit trap): $GCS_CKPT_URI" || echo "WARNING: gsutil cp failed (trap)"; fi; }
+  trap sync_ckpt EXIT
+  command -v gsutil >/dev/null 2>&1 || echo "WARNING: gsutil not in PATH; per-epoch upload may fail."
+  python main.py --config config/examples/time_dep/maglif_long_rollout.json
+  echo "Training done; ensuring best checkpoint is in GCS..."
+  if [ -f "$BEST_PT" ]; then
+    gsutil -m cp "$BEST_PT" "$GCS_CKPT_URI" && echo "Checkpoint synced to GCS: $GCS_CKPT_URI" || echo "WARNING: gsutil cp failed"
+  fi

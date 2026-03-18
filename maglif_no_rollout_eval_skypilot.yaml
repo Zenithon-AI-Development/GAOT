@@ -1,0 +1,60 @@
+# Eval-only: load best checkpoint from no-rollout run, run test (AR trajectory + animation).
+# Checkpoint must exist at gs://zen_ml_checkpoints/gaot_maglif_long_rollout_no_rollouts/maglif_long_rollout_no_rollouts.best.pt
+# Launch: sky jobs launch maglif_no_rollout_eval_skypilot.yaml -n maglif-no-rollout-eval -y
+name: maglif-no-rollout-eval
+
+file_mounts:
+  /home/shared_info/new_processed_maglif: gs://data-share-bucket-zenithon/new_processed_maglif
+  /tmp/gcs_checkpoints: gs://zen_ml_checkpoints
+  /tmp/gcs_logs: gs://zen_ml_logs
+  /tmp/gcs_data: gs://zen_ml_data
+
+resources:
+  cpus: 4
+  accelerators: T4:1
+  use_spot: true
+  region: us-central1
+  disk_size: 100
+  labels:
+    project: fluid
+    type: model_training
+    team: ml
+    name: david
+
+num_nodes: 1
+
+setup: |
+  git clone -b development https://github.com/Zenithon-AI-Development/GAOT.git /tmp/gaot
+  cd /tmp/gaot
+  if ! conda env list | grep -q gaot_env; then
+    conda create -n gaot_env python=3.10 -y
+  fi
+  conda activate gaot_env
+  pip install -q toml wandb omegaconf xarray rotary-embedding-torch numpy torch matplotlib tqdm scipy h5py
+  python -c "import torch; v=torch.__version__; c=torch.version.cuda or 'cpu'; print(f'torch-{v.split(\"+\")[0]}+{c}')" > /tmp/torch_ver.txt
+  TORCH_VER=$(cat /tmp/torch_ver.txt)
+  pip install torch-scatter -f https://data.pyg.org/whl/${TORCH_VER}.html || pip install torch-scatter --no-build-isolation
+
+run: |
+  set -e
+  source $(conda info --base)/etc/profile.d/conda.sh
+  if [ ! -d /tmp/gaot ]; then
+    git clone -b development https://github.com/Zenithon-AI-Development/GAOT.git /tmp/gaot
+  fi
+  cd /tmp/gaot
+  conda activate gaot_env || (conda create -n gaot_env python=3.10 -y && conda activate gaot_env && pip install -q toml wandb omegaconf xarray rotary-embedding-torch numpy torch matplotlib tqdm scipy h5py && python -c "import torch; v=torch.__version__; c=torch.version.cuda or '\''cpu'\''; print(f'\''torch-{v.split(\"+\")[0]}+{c}'\'')" > /tmp/torch_ver.txt && pip install torch-scatter -f https://data.pyg.org/whl/$(cat /tmp/torch_ver.txt).html || pip install torch-scatter --no-build-isolation)
+  cd /tmp/gaot && git pull origin development || true
+  python -c "import pathlib; p=pathlib.Path('/tmp/gaot/src/core/default_configs.py'); s=p.read_text(); s=s.replace('    merged_config = OmegaConf.merge(default_config_struct, user_config)','    OmegaConf.set_struct(default_config_struct, False)\n    merged_config = OmegaConf.merge(default_config_struct, user_config)') if 'set_struct' not in s else s; p.write_text(s)"
+  EVAL_DIR=/tmp/gcs_logs/gaot_maglif_long_rollout_no_rollouts_eval
+  CKPT_DIR=/tmp/gcs_checkpoints/gaot_maglif_long_rollout_no_rollouts
+  mkdir -p "$EVAL_DIR" "$CKPT_DIR" /tmp/gaot/.ckpt/examples/time_dep /tmp/gaot/.results/examples/time_dep
+  if [ ! -f "$CKPT_DIR/maglif_long_rollout_no_rollouts.best.pt" ]; then
+    echo "ERROR: Best checkpoint not found at $CKPT_DIR/maglif_long_rollout_no_rollouts.best.pt"
+    echo "No-rollout run (1072) failed before syncing; re-run no-rollout training to populate GCS, or copy the checkpoint there."
+    exit 1
+  fi
+  cp -v "$CKPT_DIR/maglif_long_rollout_no_rollouts.best.pt" /tmp/gaot/.ckpt/examples/time_dep/
+  python main.py --config config/examples/time_dep/maglif_long_rollout_no_rollouts_eval.json
+  cp -v /tmp/gaot/.results/examples/time_dep/maglif_long_rollout_no_rollouts_eval*.gif "$EVAL_DIR/" 2>/dev/null || true
+  cp -v /tmp/gaot/.results/examples/time_dep/maglif_long_rollout_no_rollouts_eval*.png "$EVAL_DIR/" 2>/dev/null || true
+  echo "Animations (if any) under $EVAL_DIR (GCS: gs://zen_ml_logs/gaot_maglif_long_rollout_no_rollouts_eval/)"
